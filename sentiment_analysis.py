@@ -12,6 +12,7 @@ from datetime import datetime, timedelta
 from urllib.parse import quote
 from typing import Dict, List, Optional, Tuple
 from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import pandas as pd
 import numpy as np
@@ -39,6 +40,14 @@ from utils import (
 )
 
 logger = setup_logger("sentiment")
+SENTIMENT_CACHE_KEY = "sentiment_scores_v2"
+TICKER_SENTIMENT_CACHE_PREFIX = "ticker_sentiment_v2"
+CORPORATE_SUFFIXES = {
+    "adr", "ag", "co", "company", "corp", "corporation", "di", "group",
+    "holding", "holdings", "inc", "limited", "ltd", "nv", "ordinary",
+    "ord", "plc", "s", "sa", "se", "shares", "spa", "stock", "the",
+}
+GENERIC_SINGLE_WORD_NAMES = {"next"}
 
 # ============================================================================
 # SENTIMENT ANALYZER INITIALISATION
@@ -140,7 +149,8 @@ def fetch_rss_news(
 
 def fetch_ticker_news(
     ticker: str,
-    max_articles: int = 20
+    max_articles: int = 20,
+    ticker_name: str = None
 ) -> List[Dict]:
     """
     Fetch news specifically for a single ticker using yfinance and RSS.
@@ -176,11 +186,20 @@ def fetch_ticker_news(
     
     # Method 2: Google News RSS
     try:
-        company_name = ticker_to_name(ticker)
-        search_query = f"{company_name} stock"
+        company_name = build_search_name(ticker_name or ticker_to_name(ticker), ticker)
+        search_query = f"\"{company_name}\" stock"
         google_rss_url = f"https://news.google.com/rss/search?q={quote(search_query)}+when:7d&hl=en"
         
-        feed = feedparser.parse(google_rss_url)
+        # Google News blocks direct feedparser requests, use requests with User-Agent
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
+        }
+        res = requests.get(google_rss_url, headers=headers, timeout=10)
+        feed = feedparser.parse(res.content)
+        
+        if not feed.entries:
+            logger.warning(f"Google News returned 0 entries for {ticker} (possible block/rate limit)")
+            
         for entry in feed.entries[:max_articles]:
             articles.append({
                 "title": entry.get("title", ""),
@@ -193,7 +212,16 @@ def fetch_ticker_news(
     except Exception as e:
         logger.debug(f"Google News fetch failed for {ticker}: {e}")
     
-    return articles
+    filtered = [
+        article for article in dedupe_articles(articles)
+        if article_matches_ticker(
+            article,
+            ticker,
+            ticker_name=ticker_name,
+            allow_generic_single_word=True
+        )
+    ]
+    return filtered
 
 
 # ============================================================================
@@ -246,6 +274,182 @@ def detect_events(text: str) -> Dict[str, bool]:
     return events
 
 
+def normalise_text(text: str) -> str:
+    """Lowercase and strip punctuation for matching/search."""
+    return re.sub(r"[^a-z0-9]+", " ", str(text).lower()).strip()
+
+
+def extract_company_tokens(name: str) -> List[str]:
+    """Reduce noisy quote/security names to core company tokens."""
+    tokens = []
+    for token in normalise_text(name).split():
+        if token in CORPORATE_SUFFIXES:
+            continue
+        if token.isdigit():
+            continue
+        if re.fullmatch(r"[a-z]*\d+[a-z]*", token):
+            continue
+        if len(token) < 2:
+            continue
+        tokens.append(token)
+    return tokens
+
+
+def build_search_name(name: str, ticker: str) -> str:
+    """Build a cleaner company name for ticker-specific news search."""
+    raw_tokens = [
+        token for token in normalise_text(name).split()
+        if token and not token.isdigit() and token not in {"ord", "ordinary", "shares", "stock"}
+    ]
+    tokens = extract_company_tokens(name)
+    if len(tokens) == 1 and tokens[0] in GENERIC_SINGLE_WORD_NAMES and len(raw_tokens) >= 2:
+        return " ".join(raw_tokens[:2])
+    if tokens:
+        return " ".join(tokens[:4])
+    return clean_ticker(ticker)
+
+
+def build_ticker_patterns(
+    ticker: str,
+    ticker_name: str = None,
+    allow_generic_single_word: bool = False
+) -> List[str]:
+    """Build conservative article-match patterns to reduce false positives."""
+    base_ticker = clean_ticker(ticker).lower()
+    patterns = []
+    raw_name = ticker_name or ticker_to_name(ticker)
+    raw_tokens = [
+        token for token in normalise_text(raw_name).split()
+        if token and not token.isdigit() and token not in {"ord", "ordinary", "shares", "stock"}
+    ]
+    tokens = extract_company_tokens(raw_name)
+
+    if len(tokens) >= 2:
+        patterns.append(" ".join(tokens[:4]))
+        patterns.append(" ".join(tokens[:2]))
+    elif len(tokens) == 1:
+        token = tokens[0]
+        if allow_generic_single_word and token in GENERIC_SINGLE_WORD_NAMES and len(raw_tokens) >= 2:
+            patterns.append(" ".join(raw_tokens[:2]))
+        if len(token) >= 5 or allow_generic_single_word:
+            if allow_generic_single_word or token not in GENERIC_SINGLE_WORD_NAMES:
+                patterns.append(token)
+
+    if len(base_ticker) >= 4:
+        if allow_generic_single_word or base_ticker not in GENERIC_SINGLE_WORD_NAMES:
+            patterns.append(base_ticker)
+
+    deduped = []
+    seen = set()
+    for pattern in patterns:
+        if pattern and pattern not in seen:
+            deduped.append(pattern)
+            seen.add(pattern)
+    return deduped
+
+
+def dedupe_articles(articles: List[Dict]) -> List[Dict]:
+    """Remove duplicate articles by link/title while preserving order."""
+    unique = []
+    seen = set()
+
+    for article in articles:
+        if not article.get("title") and not article.get("summary"):
+            continue
+        key = (
+            article.get("link", "").strip(),
+            normalise_text(article.get("title", "")),
+        )
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append(article)
+
+    return unique
+
+
+def article_matches_ticker(
+    article: Dict,
+    ticker: str,
+    ticker_name: str = None,
+    allow_generic_single_word: bool = False
+) -> bool:
+    """Check if an article text/title matches the intended company."""
+    patterns = build_ticker_patterns(
+        ticker,
+        ticker_name=ticker_name,
+        allow_generic_single_word=allow_generic_single_word
+    )
+    if not patterns:
+        return True
+
+    title = article.get("title", "").lower()
+    text = article.get("full_text", "").lower()
+    for pattern in patterns:
+        if len(pattern) >= 3 and (
+            re.search(r"\b" + re.escape(pattern) + r"\b", title) or
+            re.search(r"\b" + re.escape(pattern) + r"\b", text)
+        ):
+            return True
+    return False
+
+
+def build_sentiment_record(
+    ticker: str,
+    articles: List[Dict],
+    analyzer=None
+) -> Dict:
+    """Aggregate article-level sentiment into a single ticker record."""
+    record = {"ticker": ticker}
+    ticker_arts = dedupe_articles(articles)
+
+    if not ticker_arts:
+        record["sentiment_score"] = 0.0
+        record["sentiment_count"] = 0
+        record["sentiment_positive"] = 0.0
+        record["sentiment_negative"] = 0.0
+        for event_type in EVENT_KEYWORDS:
+            record[f"event_{event_type}"] = False
+        record["headlines"] = []
+        return record
+
+    scores = []
+    all_events = defaultdict(bool)
+    headlines = []
+
+    for art in ticker_arts:
+        text = art.get("full_text", "")
+        sent = score_sentiment(text, analyzer)
+        scores.append(sent["compound"])
+
+        events = detect_events(text)
+        for event_type, detected in events.items():
+            if detected:
+                all_events[event_type] = True
+
+        if art.get("title"):
+            headlines.append({
+                "title": art["title"],
+                "source": art.get("source", ""),
+                "published": art.get("published", ""),
+                "link": art.get("link", ""),
+                "sentiment": sent["compound"],
+            })
+
+    scores_arr = np.array(scores)
+    record["sentiment_score"] = float(np.mean(scores_arr))
+    record["sentiment_count"] = len(scores)
+    record["sentiment_positive"] = float(np.mean(scores_arr > 0.05))
+    record["sentiment_negative"] = float(np.mean(scores_arr < -0.05))
+
+    for event_type in EVENT_KEYWORDS:
+        record[f"event_{event_type}"] = all_events.get(event_type, False)
+
+    headlines.sort(key=lambda x: abs(x.get("sentiment", 0)), reverse=True)
+    record["headlines"] = headlines[:10]
+    return record
+
+
 # ============================================================================
 # TICKER MATCHING
 # ============================================================================
@@ -272,17 +476,13 @@ def match_articles_to_tickers(
     ticker_articles = defaultdict(list)
     
     # Build search patterns for each ticker
-    ticker_patterns = {}
-    for ticker in tickers:
-        name = ticker_names.get(ticker) if ticker_names else ticker_to_name(ticker)
-        # Fallback to ticker if name is None or empty
-        name_val = str(name) if name else ticker
-        clean = clean_ticker(ticker)
-        patterns = [name_val.lower(), clean.lower()]
-        # Add common variations
-        if "." in ticker and len(ticker.split(".")[0]) >= 4:
-            patterns.append(ticker.split(".")[0].lower())
-        ticker_patterns[ticker] = patterns
+    ticker_patterns = {
+        ticker: build_ticker_patterns(
+            ticker,
+            ticker_names.get(ticker) if ticker_names else None
+        )
+        for ticker in tickers
+    }
     
     for article in articles:
         text = article.get("full_text", "").lower()
@@ -327,7 +527,7 @@ def compute_ticker_sentiment(
     Returns:
         DataFrame with sentiment data indexed by ticker
     """
-    cache_key = "sentiment_scores"
+    cache_key = SENTIMENT_CACHE_KEY
     
     analyzer = get_analyzer()
     
@@ -342,73 +542,22 @@ def compute_ticker_sentiment(
     records = []
     
     for ticker in tickers:
-        record = {"ticker": ticker}
-        
         # Collect all articles for this ticker
         ticker_arts = matched.get(ticker, [])
         
         # Optionally fetch ticker-specific news
         if fetch_individual and len(ticker_arts) < 3:
             try:
-                specific = fetch_ticker_news(ticker, max_articles=10)
+                specific = fetch_ticker_news(
+                    ticker,
+                    max_articles=10,
+                    ticker_name=ticker_names.get(ticker) if ticker_names else None
+                )
                 ticker_arts.extend(specific)
             except Exception as e:
                 logger.debug(f"fetch_ticker_news failed for {ticker}: {e}")
-        
-        if not ticker_arts:
-            record["sentiment_score"] = 0.0
-            record["sentiment_count"] = 0
-            record["sentiment_positive"] = 0.0
-            record["sentiment_negative"] = 0.0
-            for event_type in EVENT_KEYWORDS:
-                record[f"event_{event_type}"] = False
-            record["headlines"] = []
-            records.append(record)
-            continue
-        
-        # Score each article
-        scores = []
-        all_events = defaultdict(bool)
-        headlines = []
-        
-        for art in ticker_arts:
-            text = art.get("full_text", "")
-            
-            # Sentiment
-            sent = score_sentiment(text, analyzer)
-            scores.append(sent["compound"])
-            
-            # Event detection
-            events = detect_events(text)
-            for event_type, detected in events.items():
-                if detected:
-                    all_events[event_type] = True
-            
-            # Headlines
-            if art.get("title"):
-                headlines.append({
-                    "title": art["title"],
-                    "source": art.get("source", ""),
-                    "published": art.get("published", ""),
-                    "sentiment": sent["compound"],
-                })
-        
-        # Aggregate sentiment
-        scores_arr = np.array(scores)
-        record["sentiment_score"] = float(np.mean(scores_arr))
-        record["sentiment_count"] = len(scores)
-        record["sentiment_positive"] = float(np.mean(scores_arr > 0.05))
-        record["sentiment_negative"] = float(np.mean(scores_arr < -0.05))
-        
-        # Event flags
-        for event_type in EVENT_KEYWORDS:
-            record[f"event_{event_type}"] = all_events.get(event_type, False)
-        
-        # Top headlines (sorted by absolute sentiment)
-        headlines.sort(key=lambda x: abs(x.get("sentiment", 0)), reverse=True)
-        record["headlines"] = headlines[:10]
-        
-        records.append(record)
+
+        records.append(build_sentiment_record(ticker, ticker_arts, analyzer))
     
     if not records:
         return pd.DataFrame()
@@ -501,7 +650,7 @@ def run_sentiment_pipeline(
     logger.info("=" * 60)
     
     # Check cache first to avoid wasteful RSS fetches
-    cached = load_from_cache("sentiment_scores", max_age_hours=CACHE_EXPIRY_HOURS)
+    cached = load_from_cache(SENTIMENT_CACHE_KEY, max_age_hours=CACHE_EXPIRY_HOURS)
     if cached is not None and len(cached) > 0:
         logger.info(f"Loaded sentiment data from cache ({len(cached)} tickers)")
         return cached, get_sentiment_summary(cached)
@@ -525,6 +674,63 @@ def run_sentiment_pipeline(
     logger.info("=" * 60)
     
     return sentiment_df, summary
+
+
+def get_ticker_sentiment_snapshot(
+    ticker: str,
+    ticker_name: str = None,
+    max_articles: int = 10,
+    max_age_hours: int = 4
+) -> Dict:
+    """Fetch and cache a live sentiment snapshot for a single ticker."""
+    cache_key = f"{TICKER_SENTIMENT_CACHE_PREFIX}_{clean_ticker(ticker).lower()}"
+    cached = load_from_cache(cache_key, max_age_hours=max_age_hours)
+    if cached is not None:
+        return cached
+
+    analyzer = get_analyzer()
+    articles = fetch_ticker_news(
+        ticker,
+        max_articles=max_articles,
+        ticker_name=ticker_name
+    )
+    snapshot = build_sentiment_record(ticker, articles, analyzer)
+    save_to_cache(cache_key, snapshot)
+    return snapshot
+
+
+def get_ticker_sentiment_snapshots(
+    tickers: List[str],
+    ticker_names: Dict[str, str] = None,
+    max_articles: int = 10,
+    max_workers: int = 6
+) -> pd.DataFrame:
+    """Fetch live sentiment snapshots for a small list of priority tickers."""
+    if not tickers:
+        return pd.DataFrame()
+
+    records = []
+
+    def _fetch_snapshot(ticker: str) -> Dict:
+        return get_ticker_sentiment_snapshot(
+            ticker,
+            ticker_name=ticker_names.get(ticker) if ticker_names else None,
+            max_articles=max_articles,
+        )
+
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = {executor.submit(_fetch_snapshot, ticker): ticker for ticker in tickers}
+        for future in as_completed(futures):
+            ticker = futures[future]
+            try:
+                records.append(future.result())
+            except Exception as exc:
+                logger.warning(f"Live sentiment fetch failed for {ticker}: {exc}")
+
+    if not records:
+        return pd.DataFrame()
+
+    return pd.DataFrame(records).set_index("ticker")
 
 
 # ============================================================================

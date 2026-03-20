@@ -8,7 +8,8 @@ functions used across all modules.
 import os
 import logging
 import pickle
-import hashlib
+import threading
+from collections import defaultdict
 from datetime import datetime, timedelta
 from typing import Any, Optional
 
@@ -86,6 +87,9 @@ def get_cache_path(key: str) -> str:
     return os.path.join(DATA_DIR, f"cache_{safe_key}.pkl")
 
 
+# Module level cache lock
+cache_locks = defaultdict(threading.Lock)
+
 def save_to_cache(key: str, data: Any) -> None:
     """
     Persist data to disk cache using pickle.
@@ -96,8 +100,9 @@ def save_to_cache(key: str, data: Any) -> None:
     """
     ensure_directories()
     path = get_cache_path(key)
-    with open(path, "wb") as f:
-        pickle.dump({"timestamp": datetime.now(), "data": data}, f)
+    with cache_locks[key]:
+        with open(path, "wb") as f:
+            pickle.dump({"timestamp": datetime.now(), "data": data}, f)
 
 
 def load_from_cache(key: str, max_age_hours: int = CACHE_EXPIRY_HOURS) -> Optional[Any]:
@@ -159,6 +164,8 @@ def fmt_pct(value: float, decimals: int = 1) -> str:
     """Format a decimal as a percentage string (e.g., 0.154 → '15.4%')."""
     if pd.isna(value):
         return "N/A"
+    if abs(value) > 2:
+        logging.getLogger("utils").warning(f"fmt_pct received {value} — may already be a percentage")
     return f"{value * 100:.{decimals}f}%"
 
 
@@ -246,40 +253,63 @@ def clean_ticker(ticker: str) -> str:
     return ticker.split(".")[0]
 
 
+_NAME_MAP = {
+    "MC.PA": "LVMH", "OR.PA": "L'Oréal", "TTE.PA": "TotalEnergies",
+    "SAN.PA": "Sanofi", "AIR.PA": "Airbus", "BNP.PA": "BNP Paribas",
+    "SU.PA": "Schneider Electric", "ACA.PA": "Crédit Agricole",
+    "RMS.PA": "Hermès", "KER.PA": "Kering", "SAF.PA": "Safran",
+    "DG.PA": "Vinci", "RI.PA": "Pernod Ricard", "EL.PA": "EssilorLuxottica",
+    "BN.PA": "Danone", "CS.PA": "AXA", "ENGI.PA": "Engie",
+    "CAP.PA": "Capgemini", "GLE.PA": "Société Générale",
+    "SAP.DE": "SAP", "SIE.DE": "Siemens", "ALV.DE": "Allianz",
+    "MBG.DE": "Mercedes-Benz", "DTE.DE": "Deutsche Telekom",
+    "BAS.DE": "BASF", "BMW.DE": "BMW", "BAYN.DE": "Bayer",
+    "MUV2.DE": "Munich Re", "ADS.DE": "Adidas", "IFX.DE": "Infineon",
+    "DBK.DE": "Deutsche Bank", "VOW3.DE": "Volkswagen",
+    "RWE.DE": "RWE", "HEN3.DE": "Henkel",
+    "SHEL.L": "Shell", "AZN.L": "AstraZeneca", "HSBA.L": "HSBC",
+    "ULVR.L": "Unilever", "BP.L": "BP", "GSK.L": "GSK",
+    "RIO.L": "Rio Tinto", "BARC.L": "Barclays", "DGE.L": "Diageo",
+    "LLOY.L": "Lloyds", "GLEN.L": "Glencore", "LSEG.L": "LSEG",
+    "NXT.L": "Next", "RKT.L": "Reckitt", "VOD.L": "Vodafone",
+    "BATS.L": "BAT", "PRU.L": "Prudential", "CRH.L": "CRH",
+    "EXPN.L": "Experian",
+    "NESN.SW": "Nestlé", "NOVN.SW": "Novartis", "ROG.SW": "Roche",
+    "NOVO-B.CO": "Novo Nordisk", "ASML.AS": "ASML",
+    "PHIA.AS": "Philips", "UNA.AS": "Unilever NV",
+    "INGA.AS": "ING", "ABI.BR": "AB InBev",
+    "ENEL.MI": "Enel", "ISP.MI": "Intesa Sanpaolo",
+    "UCG.MI": "UniCredit", "ENI.MI": "ENI", "RACE.MI": "Ferrari",
+    "SAN.MC": "Santander", "IBE.MC": "Iberdrola", "TEF.MC": "Telefónica",
+    "BBVA.MC": "BBVA", "ITX.MC": "Inditex",
+}
+
+
 def ticker_to_name(ticker: str) -> str:
     """
     Convert a ticker to a more readable name.
-    Falls back to the ticker symbol if no mapping exists.
+    Falls back to yfinance metadata and then the clean ticker symbol.
     """
-    # Common European equity name mappings
-    name_map = {
-        "MC.PA": "LVMH", "OR.PA": "L'Oréal", "TTE.PA": "TotalEnergies",
-        "SAN.PA": "Sanofi", "AIR.PA": "Airbus", "BNP.PA": "BNP Paribas",
-        "SU.PA": "Schneider Electric", "ACA.PA": "Crédit Agricole",
-        "RMS.PA": "Hermès", "KER.PA": "Kering", "SAF.PA": "Safran",
-        "DG.PA": "Vinci", "RI.PA": "Pernod Ricard", "EL.PA": "EssilorLuxottica",
-        "BN.PA": "Danone", "CS.PA": "AXA", "ENGI.PA": "Engie",
-        "CAP.PA": "Capgemini", "GLE.PA": "Société Générale",
-        "SAP.DE": "SAP", "SIE.DE": "Siemens", "ALV.DE": "Allianz",
-        "MBG.DE": "Mercedes-Benz", "DTE.DE": "Deutsche Telekom",
-        "BAS.DE": "BASF", "BMW.DE": "BMW", "BAYN.DE": "Bayer",
-        "MUV2.DE": "Munich Re", "ADS.DE": "Adidas", "IFX.DE": "Infineon",
-        "DBK.DE": "Deutsche Bank", "VOW3.DE": "Volkswagen",
-        "RWE.DE": "RWE", "HEN3.DE": "Henkel",
-        "SHEL.L": "Shell", "AZN.L": "AstraZeneca", "HSBA.L": "HSBC",
-        "ULVR.L": "Unilever", "BP.L": "BP", "GSK.L": "GSK",
-        "RIO.L": "Rio Tinto", "BARC.L": "Barclays", "DGE.L": "Diageo",
-        "LLOY.L": "Lloyds", "GLEN.L": "Glencore", "LSEG.L": "LSEG",
-        "NXT.L": "Next", "RKT.L": "Reckitt", "VOD.L": "Vodafone",
-        "BATS.L": "BAT", "PRU.L": "Prudential", "CRH.L": "CRH",
-        "EXPN.L": "Experian",
-        "NESN.SW": "Nestlé", "NOVN.SW": "Novartis", "ROG.SW": "Roche",
-        "NOVO-B.CO": "Novo Nordisk", "ASML.AS": "ASML",
-        "PHIA.AS": "Philips", "UNA.AS": "Unilever NV",
-        "INGA.AS": "ING", "ABI.BR": "AB InBev",
-        "ENEL.MI": "Enel", "ISP.MI": "Intesa Sanpaolo",
-        "UCG.MI": "UniCredit", "ENI.MI": "ENI", "RACE.MI": "Ferrari",
-        "SAN.MC": "Santander", "IBE.MC": "Iberdrola", "TEF.MC": "Telefónica",
-        "BBVA.MC": "BBVA", "ITX.MC": "Inditex",
-    }
-    return name_map.get(ticker, clean_ticker(ticker))
+    name = _NAME_MAP.get(ticker)
+    if name:
+        return name
+
+    try:
+        import yfinance as yf
+
+        stock = yf.Ticker(ticker)
+        fast_info = getattr(stock, "fast_info", {}) or {}
+        info = getattr(stock, "info", {}) or {}
+        name = (
+            fast_info.get("displayName")
+            or fast_info.get("shortName")
+            or info.get("shortName")
+            or info.get("longName")
+            or clean_ticker(ticker)
+        )
+        if not name:
+            name = clean_ticker(ticker)
+        _NAME_MAP[ticker] = name
+        return name
+    except Exception:
+        return clean_ticker(ticker)

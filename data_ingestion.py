@@ -16,11 +16,15 @@ from typing import Dict, List, Optional, Tuple
 import numpy as np
 import pandas as pd
 import yfinance as yf
-import akshare as ak
 from tqdm import tqdm
 
+try:
+    import akshare as ak
+except Exception:
+    ak = None
+
 from config import (
-    FULL_UNIVERSE, START_DATE, END_DATE, DATA_DIR,
+    FULL_UNIVERSE, get_date_range, DATA_DIR,
     INDEX_TICKERS, CACHE_EXPIRY_HOURS
 )
 from utils import (
@@ -37,8 +41,8 @@ logger = setup_logger("data_ingestion")
 
 def fetch_price_data(
     tickers: List[str],
-    start: str = START_DATE,
-    end: str = END_DATE,
+    start: str = None,
+    end: str = None,
     max_workers: int = 5
 ) -> Dict[str, pd.DataFrame]:
     """
@@ -56,6 +60,8 @@ def fetch_price_data(
     Returns:
         Dictionary mapping ticker → DataFrame with OHLCV columns
     """
+    if start is None or end is None:
+        start, end, _ = get_date_range()
     cache_key = f"prices_{start}_{end}"
     cached = load_from_cache(cache_key)
     if cached is not None and len(cached) > 0:
@@ -107,8 +113,8 @@ def fetch_price_data(
 
 
 def fetch_index_data(
-    start: str = START_DATE,
-    end: str = END_DATE
+    start: str = None,
+    end: str = None
 ) -> Dict[str, pd.DataFrame]:
     """
     Fetch historical data for European market indices.
@@ -122,6 +128,8 @@ def fetch_index_data(
     Returns:
         Dictionary mapping index name → DataFrame
     """
+    if start is None or end is None:
+        start, end, _ = get_date_range()
     cache_key = f"indices_{start}_{end}"
     cached = load_from_cache(cache_key)
     if cached is not None and len(cached) > 0:
@@ -152,6 +160,9 @@ def fetch_index_data(
                 raise ValueError("Empty yf dataframe")
         except Exception as e:
             logger.warning(f"  ✗ {name} (yf) failed: {e}. Trying Akshare...")
+            if ak is None:
+                logger.warning(f"  ✗ {name}: Akshare unavailable in this environment")
+                continue
             try:
                 # Find Akshare symbol
                 ak_sym = None
@@ -271,7 +282,9 @@ def fetch_financial_data(
 
 def extract_key_metrics(
     financial_data: Dict[str, Dict],
-    price_data: Dict[str, pd.DataFrame]
+    price_data: Dict[str, pd.DataFrame],
+    start: str = None,
+    end: str = None
 ) -> pd.DataFrame:
     """
     Extract and compute key metrics from raw financial + price data.
@@ -293,7 +306,10 @@ def extract_key_metrics(
     logger.info("Extracting key metrics from financial data")
     
     # Check cache first
-    cached = load_from_cache("key_metrics")
+    if start is None or end is None:
+        start, end, _ = get_date_range()
+    cache_key = f"key_metrics_{start}_{end}"
+    cached = load_from_cache(cache_key)
     if cached is not None and len(cached) > 0:
         logger.info(f"Loaded key metrics from cache ({len(cached)} stocks)")
         return cached
@@ -495,9 +511,8 @@ def extract_key_metrics(
             df[col] = pd.to_numeric(df[col], errors="coerce")
     
     logger.info(f"Extracted metrics for {len(df)} stocks")
-    
     # Cache the metrics
-    save_to_cache("key_metrics", df)
+    save_to_cache(cache_key, df)
     
     return df
 
@@ -508,8 +523,8 @@ def extract_key_metrics(
 
 def run_data_pipeline(
     universe: List[str] = None,
-    start: str = START_DATE,
-    end: str = END_DATE
+    start: str = None,
+    end: str = None
 ) -> Tuple[Dict[str, pd.DataFrame], Dict[str, Dict], pd.DataFrame, Dict[str, pd.DataFrame]]:
     """
     Execute the full data ingestion pipeline:
@@ -527,6 +542,8 @@ def run_data_pipeline(
         Tuple of (price_data, financial_data, metrics_df, index_data)
     """
     ensure_directories()
+    if start is None or end is None:
+        start, end, _ = get_date_range()
     
     if universe is None:
         universe = FULL_UNIVERSE
@@ -548,7 +565,7 @@ def run_data_pipeline(
     financial_data = fetch_financial_data(valid_tickers)
     
     # Step 4: Extract metrics
-    metrics_df = extract_key_metrics(financial_data, price_data)
+    metrics_df = extract_key_metrics(financial_data, price_data, start, end)
     
     logger.info("=" * 60)
     logger.info("DATA INGESTION COMPLETE")

@@ -12,7 +12,7 @@ from datetime import datetime, timedelta
 from typing import Dict, List, Tuple, Optional
 
 from config import (
-    FULL_UNIVERSE, FACTOR_WEIGHTS, START_DATE, END_DATE,
+    FULL_UNIVERSE, FACTOR_WEIGHTS,
     LONG_THRESHOLD_PERCENTILE, SHORT_THRESHOLD_PERCENTILE
 )
 from utils import (
@@ -146,7 +146,7 @@ class BacktestEngine:
                 weight_sum += weight
         
         if weight_sum > 0:
-            composite = composite / weight_sum * 100
+            composite = composite / weight_sum
         
         scores["composite_score"] = composite
         
@@ -319,8 +319,8 @@ class BacktestEngine:
         }
         
         # Log summary
-        logger.info(f"Backtest complete:")
-        for k, v in metrics.items():
+        logger.info(f"Backtest complete (Sharpe rf=0 assumed):")
+        for k, v in results["metrics"].items():
             logger.info(f"  {k}: {v}")
         
         save_to_cache("backtest_results", results)
@@ -365,10 +365,10 @@ class BacktestEngine:
             vol = returns.std() * np.sqrt(252)
             metrics[f"{name}_volatility{lb}"] = f"{vol:.2%}"
             
-            # Sharpe Ratio
+            # Sharpe Ratio (assuming rf=0)
             if vol > 0:
                 sharpe = ann_ret / vol
-                metrics[f"{name}_sharpe_ratio{lb}"] = f"{sharpe:.2f}"
+                metrics[f"{name}_sharpe_rf0{lb}"] = f"{sharpe:.2f}"
             
             # Max Drawdown
             cum_ret = (1 + returns).cumprod()

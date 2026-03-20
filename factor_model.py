@@ -155,6 +155,17 @@ def compute_composite_score(
         weights = FACTOR_WEIGHTS
     
     df = metrics.copy()
+    factor_cols = [factor for factor in weights if factor in df.columns]
+    composite = pd.Series(0.0, index=df.index, dtype=float)
+    weight_sum = 0.0
+    
+    if not factor_cols:
+        logger.warning("No factor rank columns available; assigning neutral composite scores")
+        df["composite_score"] = 50.0
+        df["value_score"] = 50.0
+        df["quality_score"] = 50.0
+        df["momentum_score"] = 50.0
+        return df
     
     # Count NaNs across factor columns to flag low-quality data
     nan_counts = df[factor_cols].isna().sum(axis=1)

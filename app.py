@@ -18,8 +18,8 @@ import plotly.express as px
 from plotly.subplots import make_subplots
 
 from config import (
-    FULL_UNIVERSE, COUNTRY_MAP, INDEX_TICKERS,
-    START_DATE, END_DATE, FACTOR_WEIGHTS
+    FULL_UNIVERSE, CAC_40, DAX_40, FTSE_100, STOXX_SUBSET,
+    FACTOR_WEIGHTS, COUNTRY_MAP
 )
 from utils import (
     fmt_pct, fmt_number, fmt_large_number, fmt_ratio,
@@ -137,7 +137,6 @@ def load_all_data():
     """
     from data_ingestion import run_data_pipeline
     from factor_model import run_factor_model, suggest_relative_trades
-    from financial_analysis import run_financial_analysis
     from sentiment_analysis import run_sentiment_pipeline
     
     ensure_directories()
@@ -148,9 +147,7 @@ def load_all_data():
     # Factor model
     scored_universe, long_book, short_book = run_factor_model(metrics_df)
     
-    # Financial analysis
-    fin_analysis = run_financial_analysis(financial_data, price_data, index_data)
-    
+    # Financial analysis execution removed as it is entirely unused by the UI
     # Sentiment analysis
     ticker_names = metrics_df["name"].to_dict() if "name" in metrics_df.columns else {}
     sentiment_df, sentiment_summary = run_sentiment_pipeline(
@@ -188,11 +185,70 @@ def load_all_data():
         "scored_universe": scored_universe,
         "long_book": long_book,
         "short_book": short_book,
-        "fin_analysis": fin_analysis,
         "sentiment_df": sentiment_df,
         "sentiment_summary": sentiment_summary,
         "pairs": pairs,
     }
+
+
+@st.cache_data(
+    ttl=1800,
+    show_spinner=False,
+    hash_funcs={dict: lambda d: str(sorted(d.items()))}
+)
+def load_live_sentiment_for_tickers(tickers, ticker_names):
+    """Fetch live news/sentiment for the small set of tickers shown in the UI."""
+    from sentiment_analysis import get_ticker_sentiment_snapshots
+
+    if not tickers:
+        return pd.DataFrame()
+
+    return get_ticker_sentiment_snapshots(
+        list(tickers),
+        ticker_names=ticker_names,
+        max_articles=8,
+    )
+
+
+@st.cache_data(ttl=1800, show_spinner="Loading latest company news...")
+def load_live_sentiment_for_ticker(ticker, ticker_name):
+    """Fetch live news/sentiment for the selected drill-down stock."""
+    from sentiment_analysis import get_ticker_sentiment_snapshot
+
+    return get_ticker_sentiment_snapshot(
+        ticker,
+        ticker_name=ticker_name,
+        max_articles=10,
+    )
+
+
+def apply_live_sentiment(base_df, live_df):
+    """Override cached sentiment with fresher per-ticker snapshots."""
+    if base_df.empty or live_df is None or live_df.empty:
+        return base_df
+
+    updated = base_df.copy()
+    common = updated.index.intersection(live_df.index)
+    if len(common) == 0:
+        return updated
+
+    for col in live_df.columns:
+        updated.loc[common, col] = live_df.loc[common, col]
+
+    return updated
+
+
+def render_sentiment_label(row):
+    """Render a human-friendly sentiment label."""
+    sentiment = row.get("sentiment_score", 0)
+    sentiment_count = row.get("sentiment_count", 0)
+
+    if sentiment_count is None or pd.isna(sentiment_count) or float(sentiment_count) <= 0:
+        st.markdown("Sent: No news")
+        return
+
+    sent_color = "🟢" if sentiment > 0.05 else "🔴" if sentiment < -0.05 else "⚪"
+    st.markdown(f"Sent: {sent_color} {sentiment:.2f}")
 
 
 # ============================================================================
@@ -350,10 +406,16 @@ def render_portfolio_ideas(data, filtered):
     
     # Intersection logic to handle sidebar filters while preserving factor-model rankings
     long_tickers = filtered.index.intersection(data["long_book"].index)
-    long_book = data["long_book"].loc[long_tickers]
+    long_book = data["long_book"].loc[long_tickers].copy()
     
     short_tickers = filtered.index.intersection(data["short_book"].index)
-    short_book = data["short_book"].loc[short_tickers]
+    short_book = data["short_book"].loc[short_tickers].copy()
+
+    priority_tickers = list(long_book.head(10).index.union(short_book.head(10).index))
+    ticker_names = filtered["name"].to_dict() if "name" in filtered.columns else {}
+    live_sentiment = load_live_sentiment_for_tickers(priority_tickers, ticker_names)
+    long_book = apply_live_sentiment(long_book, live_sentiment)
+    short_book = apply_live_sentiment(short_book, live_sentiment)
     
     with col_long:
         st.markdown(
@@ -375,8 +437,7 @@ def render_portfolio_ideas(data, filtered):
                     with c2:
                         st.markdown(f"Score: **{score:.0f}**")
                     with c3:
-                        sent_color = "🟢" if sentiment > 0.05 else "🔴" if sentiment < -0.05 else "⚪"
-                        st.markdown(f"Sent: {sent_color} {sentiment:.2f}")
+                        render_sentiment_label(row)
                     
                     # Mini factor bar
                     val = row.get("value_score", 50)
@@ -428,8 +489,7 @@ def render_portfolio_ideas(data, filtered):
                     with c2:
                         st.markdown(f"Score: **{score:.0f}**")
                     with c3:
-                        sent_color = "🟢" if sentiment > 0.05 else "🔴" if sentiment < -0.05 else "⚪"
-                        st.markdown(f"Sent: {sent_color} {sentiment:.2f}")
+                        render_sentiment_label(row)
                     
                     val = row.get("value_score", 50)
                     qual = row.get("quality_score", 50)
@@ -496,8 +556,13 @@ def render_stock_drilldown(data, filtered):
     if selected_ticker is None:
         return
     
-    row = filtered.loc[selected_ticker]
+    row = filtered.loc[selected_ticker].copy()
     name = row.get("name", ticker_to_name(selected_ticker))
+    live_snapshot = load_live_sentiment_for_ticker(selected_ticker, name)
+    if isinstance(live_snapshot, dict) and live_snapshot:
+        for key, value in live_snapshot.items():
+            if key != "ticker":
+                row[key] = value
     
     st.markdown(f"### {name} ({selected_ticker})")
     
@@ -521,7 +586,13 @@ def render_stock_drilldown(data, filtered):
     
     for i, (label, val, fmt) in enumerate(metrics_display):
         with metric_cols[i]:
-            if val is not None and not pd.isna(val):
+            if label == "Sentiment" and (
+                row.get("sentiment_count") is None or
+                pd.isna(row.get("sentiment_count")) or
+                float(row.get("sentiment_count", 0)) <= 0
+            ):
+                st.metric(label, "No news")
+            elif val is not None and not pd.isna(val):
                 st.metric(label, fmt.format(val))
             else:
                 st.metric(label, "N/A")
@@ -672,7 +743,22 @@ def render_stock_drilldown(data, filtered):
                 emoji = "🟢" if sent > 0.05 else "🔴" if sent < -0.05 else "⚪"
                 title = h.get("title", "")
                 source = h.get("source", "")
-                st.markdown(f"{emoji} **{title}** — _{source}_")
+                link = h.get("link", "")
+                published = h.get("published", "")
+                meta_parts = [f"_{source}_"] if source else []
+                if published:
+                    meta_parts.append(f"`{published}`")
+                meta = " · ".join(meta_parts)
+                if link:
+                    if meta:
+                        st.markdown(f"{emoji} [{title}]({link}) — {meta}")
+                    else:
+                        st.markdown(f"{emoji} [{title}]({link})")
+                else:
+                    if meta:
+                        st.markdown(f"{emoji} **{title}** — {meta}")
+                    else:
+                        st.markdown(f"{emoji} **{title}**")
     else:
         st.info("No recent news headlines available for this stock.")
 
