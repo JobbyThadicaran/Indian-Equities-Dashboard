@@ -1,0 +1,31 @@
+# European Long/Short Equity Research System
+# ============================================
+
+# Data fetching
+yfinance
+akshare
+requests
+feedparser
+beautifulsoup4
+
+# Data processing & analytics
+pandas
+numpy
+scipy
+
+# Sentiment analysis
+nltk
+vaderSentiment
+
+# Visualization
+plotly
+matplotlib
+
+# Dashboard
+streamlit
+
+# PDF report generation
+reportlab
+
+# Utilities
+tqdm
