@@ -178,20 +178,24 @@ class BacktestEngine:
         
         # Generate monthly rebalance dates
         all_dates = self.price_panel.index
+        # Version-safe frequency: 'ME' for pandas >= 2.2, 'M' otherwise
+        freq = "ME" if pd.__version__ >= "2.2" else "M"
+        
         rebalance_dates = pd.date_range(
             start=all_dates[63],  # Start after 3 months of data
             end=all_dates[-1],
-            freq="ME"  # Month-end
+            freq=freq
         )
         # Filter to dates that exist in our data
         rebalance_dates = [d for d in rebalance_dates if d <= all_dates[-1]]
         
+        logger.warning("LOOK-AHEAD BIAS: fundamental factors are point-in-time as of today.")
         logger.info(f"Rebalance dates: {len(rebalance_dates)} months")
         
         # Track portfolio state
-        portfolio_returns = pd.Series(dtype=float)
-        long_returns = pd.Series(dtype=float)
-        short_returns = pd.Series(dtype=float)
+        portfolio_returns_list = []
+        long_returns_list = []
+        short_returns_list = []
         rebalance_log = []
         current_longs = []
         current_shorts = []
@@ -257,28 +261,30 @@ class BacktestEngine:
                 continue
             
             # Equal-weight portfolio returns
+            valid_l = []
             if current_longs:
-                valid_longs = [l for l in current_longs if l in period_returns.columns]
-                if valid_longs:
-                    long_ret = period_returns[valid_longs].mean(axis=1)
-                    long_returns = pd.concat([long_returns, long_ret])
+                valid_l = [l for l in current_longs if l in period_returns.columns]
+                if valid_l:
+                    long_returns_list.append(period_returns[valid_l].mean(axis=1))
             
+            valid_s = []
             if current_shorts:
-                valid_shorts = [s for s in current_shorts if s in period_returns.columns]
-                if valid_shorts:
-                    short_ret = -period_returns[valid_shorts].mean(axis=1)  # Short = negative return
-                    short_returns = pd.concat([short_returns, short_ret])
+                valid_s = [s for s in current_shorts if s in period_returns.columns]
+                if valid_s:
+                    short_returns_list.append(-period_returns[valid_s].mean(axis=1)) # Short = negative return
             
             # Combined L/S portfolio (50% long, 50% short)
-            if current_longs and current_shorts:
-                valid_l = [l for l in current_longs if l in period_returns.columns]
-                valid_s = [s for s in current_shorts if s in period_returns.columns]
-                if valid_l and valid_s:
-                    combined = (
-                        0.5 * period_returns[valid_l].mean(axis=1) -
-                        0.5 * period_returns[valid_s].mean(axis=1)
-                    )
-                    portfolio_returns = pd.concat([portfolio_returns, combined])
+            if valid_l and valid_s: # Use already computed valid_l and valid_s
+                combined = (
+                    0.5 * period_returns[valid_l].mean(axis=1) +
+                    0.5 * (-period_returns[valid_s].mean(axis=1)) # Use negative for short leg
+                )
+                portfolio_returns_list.append(combined)
+        
+        # Concat once after the loop for performance
+        portfolio_returns = pd.concat(portfolio_returns_list) if portfolio_returns_list else pd.Series(dtype=float)
+        long_returns = pd.concat(long_returns_list) if long_returns_list else pd.Series(dtype=float)
+        short_returns = pd.concat(short_returns_list) if short_returns_list else pd.Series(dtype=float)
         
         # Compute cumulative returns
         if len(portfolio_returns) > 0:
@@ -335,6 +341,9 @@ class BacktestEngine:
         """
         metrics = {}
         
+        # Look-ahead bias warning suffix
+        lb = " (Look-ahead Bias)"
+        
         for name, returns in [
             ("portfolio", portfolio_returns),
             ("long_leg", long_returns),
@@ -345,25 +354,28 @@ class BacktestEngine:
             
             # Total return
             total_ret = (1 + returns).prod() - 1
-            metrics[f"{name}_total_return"] = f"{total_ret:.2%}"
+            metrics[f"{name}_total_return{lb}"] = f"{total_ret:.2%}"
             
             # Annualised return
             n_days = len(returns)
             ann_ret = (1 + total_ret) ** (252 / max(n_days, 1)) - 1
-            metrics[f"{name}_annual_return"] = f"{ann_ret:.2%}"
+            metrics[f"{name}_annual_return{lb}"] = f"{ann_ret:.2%}"
             
             # Volatility
             vol = returns.std() * np.sqrt(252)
-            metrics[f"{name}_volatility"] = f"{vol:.2%}"
+            metrics[f"{name}_volatility{lb}"] = f"{vol:.2%}"
             
             # Sharpe Ratio
             if vol > 0:
-                metrics[f"{name}_sharpe"] = f"{ann_ret / vol:.2f}"
+                sharpe = ann_ret / vol
+                metrics[f"{name}_sharpe_ratio{lb}"] = f"{sharpe:.2f}"
             
             # Max Drawdown
-            cum = (1 + returns).cumprod()
-            drawdown = cum / cum.cummax() - 1
-            metrics[f"{name}_max_drawdown"] = f"{drawdown.min():.2%}"
+            cum_ret = (1 + returns).cumprod()
+            rolling_max = cum_ret.cummax()
+            drawdown = (cum_ret - rolling_max) / rolling_max
+            max_dd = drawdown.min()
+            metrics[f"{name}_max_drawdown{lb}"] = f"{max_dd:.2%}"
             
             # Hit Rate (% of positive days)
             metrics[f"{name}_hit_rate"] = f"{(returns > 0).mean():.2%}"

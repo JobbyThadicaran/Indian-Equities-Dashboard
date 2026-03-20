@@ -129,7 +129,7 @@ st.markdown("""
 # DATA LOADING (cached)
 # ============================================================================
 
-@st.cache_data(ttl=3600, show_spinner="Loading market data...")
+@st.cache_data(ttl=3600, show_spinner="Loading market data...", hash_funcs={dict: lambda d: str(sorted(d.keys()))})
 def load_all_data():
     """
     Load all data — either from cache or by running the full pipeline.
@@ -164,6 +164,10 @@ def load_all_data():
     
     # Merge sentiment into scored universe
     if not sentiment_df.empty:
+        # Ensure sentiment_df uses ticker as index
+        if "ticker" in sentiment_df.columns:
+            sentiment_df = sentiment_df.set_index("ticker")
+        
         sentiment_cols = ["sentiment_score", "sentiment_count", "headlines"]
         available = [c for c in sentiment_cols if c in sentiment_df.columns]
         if available:
@@ -344,12 +348,12 @@ def render_portfolio_ideas(data, filtered):
     """Render Top Long and Short Ideas sections."""
     col_long, col_short = st.columns(2)
     
-    long_book = filtered[filtered.get("position", pd.Series()) == "LONG"] \
-        if "position" in filtered.columns \
-        else data["long_book"]
-    short_book = filtered[filtered.get("position", pd.Series()) == "SHORT"] \
-        if "position" in filtered.columns \
-        else data["short_book"]
+    # Intersection logic to handle sidebar filters while preserving factor-model rankings
+    long_tickers = filtered.index.intersection(data["long_book"].index)
+    long_book = data["long_book"].loc[long_tickers]
+    
+    short_tickers = filtered.index.intersection(data["short_book"].index)
+    short_book = data["short_book"].loc[short_tickers]
     
     with col_long:
         st.markdown(
@@ -537,33 +541,33 @@ def render_stock_drilldown(data, filtered):
                 vertical_spacing=0.05
             )
             
-            # Candlestick chart
-            fig.add_trace(go.Candlestick(
-                x=price_df.index,
-                open=price_df["Open"],
-                high=price_df["High"],
-                low=price_df["Low"],
-                close=price_df["Close"],
-                name="Price",
-                increasing_line_color="#27ae60",
-                decreasing_line_color="#e74c3c"
-            ), row=1, col=1)
-            
-            # Volume bars
-            if "Volume" in price_df.columns:
-                vol_colors = [
-                    "#27ae60" if price_df["Close"].iloc[i] >= price_df["Open"].iloc[i]
-                    else "#e74c3c"
-                    for i in range(len(price_df))
-                ]
-                fig.add_trace(go.Bar(
+            # Candlestick
+            fig.add_trace(
+                go.Candlestick(
                     x=price_df.index,
-                    y=price_df["Volume"],
-                    marker_color=vol_colors,
-                    opacity=0.5,
-                    name="Volume",
-                    showlegend=False
-                ), row=2, col=1)
+                    open=price_df['Open'],
+                    high=price_df['High'],
+                    low=price_df['Low'],
+                    close=price_df['Close'],
+                    name="Price"
+                ),
+                row=1, col=1
+            )
+            
+            # Vectorized volume color calculation for better performance
+            if "Volume" in price_df.columns:
+                vol_colors = np.where(price_df["Close"] >= price_df["Open"], "#27ae60", "#e74c3c").tolist()
+                
+                fig.add_trace(
+                    go.Bar(
+                        x=price_df.index,
+                        y=price_df['Volume'],
+                        marker_color=vol_colors,
+                        name="Volume",
+                        opacity=0.5
+                    ),
+                    row=2, col=1
+                )
             
             fig.update_layout(
                 height=500,
@@ -781,12 +785,14 @@ def handle_report_generation(data):
             # Offer download
             if os.path.exists(report_path):
                 with open(report_path, "rb") as f:
-                    st.download_button(
-                        "📄 Download PDF Report",
-                        f,
-                        os.path.basename(report_path),
-                        "application/pdf"
-                    )
+                    pdf_bytes = f.read()
+                st.download_button(
+                    label="📄 Download PDF Report",
+                    data=pdf_bytes,
+                    file_name=os.path.basename(report_path),
+                    mime="application/pdf"
+                )
+                st.success("Report generated successfully!")
         except Exception as e:
             st.error(f"Failed to generate report: {e}")
 

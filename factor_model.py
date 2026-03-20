@@ -156,10 +156,11 @@ def compute_composite_score(
     
     df = metrics.copy()
     
-    # Compute weighted composite score
-    factor_cols = list(weights.keys())
-    composite = pd.Series(0.0, index=df.index)
-    weight_sum = 0.0
+    # Count NaNs across factor columns to flag low-quality data
+    nan_counts = df[factor_cols].isna().sum(axis=1)
+    heavy_nan_tickers = nan_counts[nan_counts > 3].index.tolist()
+    if heavy_nan_tickers:
+        logger.warning(f"{len(heavy_nan_tickers)} stocks missing >3 factors (neutral score assigned): {heavy_nan_tickers[:5]}...")
     
     for factor, weight in weights.items():
         if factor in df.columns:
@@ -351,26 +352,28 @@ def suggest_relative_trades(
                 used_short.add(s_ticker)
     
     # Second pass: fill remaining with highest spread
-    remaining_longs = long_book[~long_book.index.isin(used_long)]
-    remaining_shorts = short_book[~short_book.index.isin(used_short)]
+    remaining_longs = long_book[~long_book.index.isin(used_long)].sort_values("composite_score", ascending=False)
+    remaining_shorts = short_book[~short_book.index.isin(used_short)].sort_values("composite_score", ascending=True)
     
     for i in range(min(len(remaining_longs), len(remaining_shorts))):
         if len(pairs) >= n_pairs:
             break
+        
         l_ticker = remaining_longs.index[i]
         s_ticker = remaining_shorts.index[i]
+        
         pairs.append({
             "long_ticker": l_ticker,
             "long_name": ticker_to_name(l_ticker),
             "short_ticker": s_ticker,
             "short_name": ticker_to_name(s_ticker),
-            "long_score": remaining_longs.iloc[i]["composite_score"],
-            "short_score": remaining_shorts.iloc[i]["composite_score"],
+            "long_score": remaining_longs.loc[l_ticker, "composite_score"],
+            "short_score": remaining_shorts.loc[s_ticker, "composite_score"],
             "score_spread": (
-                remaining_longs.iloc[i]["composite_score"] -
-                remaining_shorts.iloc[i]["composite_score"]
+                remaining_longs.loc[l_ticker, "composite_score"] -
+                remaining_shorts.loc[s_ticker, "composite_score"]
             ),
-            "sector": remaining_longs.iloc[i].get("sector", "Cross-Sector"),
+            "sector": remaining_longs.loc[l_ticker].get("sector", "Cross-Sector"),
         })
     
     # Sort by widest score spread

@@ -31,7 +31,7 @@ CAC_40 = [
 # DAX 40 — Germany (Frankfurt)
 DAX_40 = [
     "1COV.DE", "ADS.DE", "AIR.DE", "ALV.DE", "BAS.DE", "BAYN.DE",
-    "BEI.DE", "BMW.DE", "BNR.DE", "CON.DE", "1COV.DE", "DB1.DE",
+    "BEI.DE", "BMW.DE", "BNR.DE", "CON.DE", "DB1.DE",
     "DBK.DE", "DHL.DE", "DTE.DE", "DTG.DE", "ENR.DE", "FRE.DE",
     "HEI.DE", "HEN3.DE", "IFX.DE", "MBG.DE", "MRK.DE",
     "MTX.DE", "MUV2.DE", "PAH3.DE", "P911.DE", "QIA.DE", "RHM.DE",

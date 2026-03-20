@@ -31,7 +31,7 @@ try:
 except ImportError:
     NLTK_AVAILABLE = False
 
-from config import RSS_FEEDS, EVENT_KEYWORDS, FULL_UNIVERSE
+from config import RSS_FEEDS, EVENT_KEYWORDS, FULL_UNIVERSE, CACHE_EXPIRY_HOURS
 from utils import (
     setup_logger, save_to_cache, load_from_cache,
     ticker_to_name, clean_ticker
@@ -289,7 +289,11 @@ def match_articles_to_tickers(
         
         for ticker, patterns in ticker_patterns.items():
             for pattern in patterns:
-                if len(pattern) >= 3 and (pattern in title or pattern in text):
+                # Use word boundary check to avoid matching substrings (e.g., 'BNP' in 'ABNP')
+                if len(pattern) >= 3 and (
+                    re.search(r'\b' + re.escape(pattern) + r'\b', title) or 
+                    re.search(r'\b' + re.escape(pattern) + r'\b', text)
+                ):
                     ticker_articles[ticker].append(article)
                     break
     
@@ -323,7 +327,7 @@ def compute_ticker_sentiment(
         DataFrame with sentiment data indexed by ticker
     """
     cache_key = "sentiment_scores"
-    cached = load_from_cache(cache_key, max_age_hours=6)
+    cached = load_from_cache(cache_key, max_age_hours=CACHE_EXPIRY_HOURS)
     if cached is not None and len(cached) > 0:
         logger.info(f"Loaded sentiment data from cache ({len(cached)} tickers)")
         return cached

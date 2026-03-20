@@ -163,8 +163,16 @@ def fetch_index_data(
                 if ak_sym:
                     df_ak = ak.index_global_hist_sina(symbol=ak_sym)
                     if df_ak is not None and not df_ak.empty:
-                        df_ak.columns = ["Open", "High", "Low", "Close", "Volume"]
+                        # Akshare returns [date, open, high, low, close, volume]
+                        df_ak = df_ak.rename(columns={
+                            df_ak.columns[0]: "Date",
+                            df_ak.columns[1]: "Open", df_ak.columns[2]: "High",
+                            df_ak.columns[3]: "Low",  df_ak.columns[4]: "Close",
+                            df_ak.columns[5]: "Volume"
+                        })
+                        df_ak = df_ak.set_index("Date")
                         df_ak.index = pd.to_datetime(df_ak.index)
+                        
                         # Filter by date
                         df_ak = df_ak.loc[start:end]
                         index_data[name] = df_ak
@@ -361,8 +369,8 @@ def extract_key_metrics(
                             prev_revenue = income.loc[rev_key, prev_col]
                             break
                     record["revenue_growth_yoy"] = safe_divide(
-                        (revenue - prev_revenue) if revenue and prev_revenue else None,
-                        abs(prev_revenue) if prev_revenue else None
+                        (revenue - prev_revenue) if revenue is not None and prev_revenue is not None else None,
+                        prev_revenue
                     )
                     
                     # YoY Earnings Growth
@@ -372,8 +380,8 @@ def extract_key_metrics(
                             prev_ni = income.loc[ni_key, prev_col]
                             break
                     record["earnings_growth_yoy"] = safe_divide(
-                        (net_income - prev_ni) if net_income and prev_ni else None,
-                        abs(prev_ni) if prev_ni else None
+                        (net_income - prev_ni) if net_income is not None and prev_ni is not None else None,
+                        prev_ni
                     )
             
             # ------------------------------------------------------------------
