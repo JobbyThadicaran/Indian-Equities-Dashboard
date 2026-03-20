@@ -9,6 +9,7 @@ for each stock in the European equity universe.
 import re
 import time
 from datetime import datetime, timedelta
+from urllib.parse import quote
 from typing import Dict, List, Optional, Tuple
 from collections import defaultdict
 
@@ -177,7 +178,7 @@ def fetch_ticker_news(
     try:
         company_name = ticker_to_name(ticker)
         search_query = f"{company_name} stock"
-        google_rss_url = f"https://news.google.com/rss/search?q={search_query}+when:7d&hl=en"
+        google_rss_url = f"https://news.google.com/rss/search?q={quote(search_query)}+when:7d&hl=en"
         
         feed = feedparser.parse(google_rss_url)
         for entry in feed.entries[:max_articles]:
@@ -279,7 +280,7 @@ def match_articles_to_tickers(
         clean = clean_ticker(ticker)
         patterns = [name_val.lower(), clean.lower()]
         # Add common variations
-        if "." in ticker:
+        if "." in ticker and len(ticker.split(".")[0]) >= 4:
             patterns.append(ticker.split(".")[0].lower())
         ticker_patterns[ticker] = patterns
     
@@ -327,10 +328,6 @@ def compute_ticker_sentiment(
         DataFrame with sentiment data indexed by ticker
     """
     cache_key = "sentiment_scores"
-    cached = load_from_cache(cache_key, max_age_hours=CACHE_EXPIRY_HOURS)
-    if cached is not None and len(cached) > 0:
-        logger.info(f"Loaded sentiment data from cache ({len(cached)} tickers)")
-        return cached
     
     analyzer = get_analyzer()
     
@@ -355,8 +352,8 @@ def compute_ticker_sentiment(
             try:
                 specific = fetch_ticker_news(ticker, max_articles=10)
                 ticker_arts.extend(specific)
-            except Exception:
-                pass
+            except Exception as e:
+                logger.debug(f"fetch_ticker_news failed for {ticker}: {e}")
         
         if not ticker_arts:
             record["sentiment_score"] = 0.0
@@ -455,13 +452,16 @@ def get_sentiment_summary(sentiment_df: pd.DataFrame) -> Dict:
 
     active = sentiment_df[sentiment_df["sentiment_count"] > 0]
     
+    # Drop NaNs to safely compute min/max
+    scores = active["sentiment_score"].dropna()
+    
     summary = {
         "total_stocks_analysed": len(sentiment_df),
         "stocks_with_news": len(active),
         "avg_sentiment": float(active["sentiment_score"].mean()) if len(active) > 0 else 0,
         "median_sentiment": float(active["sentiment_score"].median()) if len(active) > 0 else 0,
-        "most_positive": active["sentiment_score"].idxmax() if len(active) > 0 else None,
-        "most_negative": active["sentiment_score"].idxmin() if len(active) > 0 else None,
+        "most_positive": scores.idxmax() if len(scores) > 0 else None,
+        "most_negative": scores.idxmin() if len(scores) > 0 else None,
         "pct_positive": float((active["sentiment_score"] > 0.05).mean()) if len(active) > 0 else 0,
         "pct_negative": float((active["sentiment_score"] < -0.05).mean()) if len(active) > 0 else 0,
     }
@@ -500,6 +500,12 @@ def run_sentiment_pipeline(
     logger.info(f"Universe: {len(tickers)} tickers")
     logger.info("=" * 60)
     
+    # Check cache first to avoid wasteful RSS fetches
+    cached = load_from_cache("sentiment_scores", max_age_hours=CACHE_EXPIRY_HOURS)
+    if cached is not None and len(cached) > 0:
+        logger.info(f"Loaded sentiment data from cache ({len(cached)} tickers)")
+        return cached, get_sentiment_summary(cached)
+        
     # Fetch general news
     articles = fetch_rss_news()
     

@@ -125,7 +125,7 @@ SHORT_THRESHOLD_PERCENTILE = 10  # Bottom 10% → SHORT
 # ============================================================================
 RSS_FEEDS = {
     "Yahoo Finance EU": "https://finance.yahoo.com/news/rssindex",
-    "Reuters Business": "https://www.reutersagency.com/feed/?taxonomy=best-sectors&post_type=best",
+    "Reuters Business": "https://feeds.reuters.com/reuters/businessNews",
     "MarketWatch Europe": "https://feeds.marketwatch.com/marketwatch/topstories/",
     "CNBC Europe": "https://www.cnbc.com/id/19794221/device/rss/rss.html",
     "Investing.com": "https://www.investing.com/rss/news.rss",
