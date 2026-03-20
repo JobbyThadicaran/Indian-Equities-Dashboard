@@ -8,6 +8,7 @@ Uses ReportLab for full layout control.
 
 import os
 import io
+import re
 from datetime import datetime
 from typing import Dict, List, Optional, Tuple
 
@@ -166,7 +167,8 @@ def create_price_chart(
         plt.yticks(fontsize=8)
         plt.tight_layout()
         
-        path = os.path.join(REPORTS_DIR, f"chart_{title.replace(' ', '_')[:30]}.png")
+        safe_title = re.sub(r'[^a-zA-Z0-9_\-]', '_', title)[:30]
+        path = os.path.join(REPORTS_DIR, f"chart_{safe_title}.png")
         fig.savefig(path, dpi=150, bbox_inches="tight")
         plt.close(fig)
         return path
@@ -207,7 +209,8 @@ def create_factor_breakdown_chart(
         ax.set_xlabel("Score", fontsize=8)
         plt.tight_layout()
         
-        path = os.path.join(REPORTS_DIR, f"factors_{title.replace(' ', '_')[:30]}.png")
+        safe_title = re.sub(r'[^a-zA-Z0-9_\-]', '_', title)[:30]
+        path = os.path.join(REPORTS_DIR, f"factors_{safe_title}.png")
         fig.savefig(path, dpi=150, bbox_inches="tight")
         plt.close(fig)
         return path
@@ -325,6 +328,9 @@ def build_stock_table(
     
     table_data = [headers[:len(available)]]
     
+    # Explicit mapping to prevent silent ratio misidentification
+    ratio_cols = ["composite_score", "value_score", "quality_score", "momentum_score"]
+    
     for idx, row in df.head(15).iterrows():
         row_data = []
         for col in available:
@@ -332,7 +338,9 @@ def build_stock_table(
             if pd.isna(val):
                 row_data.append("N/A")
             elif isinstance(val, float):
-                if abs(val) < 1:
+                if col in ratio_cols:
+                    row_data.append(f"{val:.1f}")
+                elif abs(val) < 1:
                     row_data.append(f"{val:.2%}")
                 elif abs(val) > 1e6:
                     row_data.append(fmt_large_number(val))
@@ -479,10 +487,10 @@ def build_stock_idea_section(
     # Stock header
     name = stock_row.get("name", ticker_to_name(ticker))
     score = stock_row.get("composite_score", 0)
-    color = GREEN if position_type == "LONG" else RED
+    color_hex = "#27ae60" if position_type == "LONG" else "#e74c3c"
     
     elements.append(Paragraph(
-        f'<font color="{color.hexval()}">{position_type}</font> — '
+        f'<font color="{color_hex}">{position_type}</font> — '
         f'{name} ({ticker}) — Score: {score:.1f}',
         styles["StockTitle"]
     ))
@@ -812,6 +820,14 @@ def generate_report(
     except Exception as e:
         logger.error(f"Failed to generate report: {e}")
         raise
+    finally:
+        # Cleanup temporary PNG charts
+        for file in os.listdir(REPORTS_DIR):
+            if file.endswith(".png"):
+                try:
+                    os.remove(os.path.join(REPORTS_DIR, file))
+                except Exception as e:
+                    logger.debug(f"Failed to cleanup PNG {file}: {e}")
     
     return output_path
 

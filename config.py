@@ -10,9 +10,14 @@ from datetime import datetime, timedelta
 # ============================================================================
 # DATE CONFIGURATION
 # ============================================================================
-END_DATE = datetime.now().strftime("%Y-%m-%d")
-START_DATE = (datetime.now() - timedelta(days=400)).strftime("%Y-%m-%d")  # ~13 months for YoY calcs
-LOOKBACK_1Y = (datetime.now() - timedelta(days=365)).strftime("%Y-%m-%d")
+def get_date_range():
+    """Returns (start_date, end_date, lookback_1y) computed at call time."""
+    end = datetime.now()
+    return (
+        (end - timedelta(days=400)).strftime("%Y-%m-%d"),
+        end.strftime("%Y-%m-%d"),
+        (end - timedelta(days=365)).strftime("%Y-%m-%d")
+    )
 
 # ============================================================================
 # EUROPEAN EQUITY UNIVERSE
@@ -24,8 +29,8 @@ CAC_40 = [
     "CAP.PA", "CA.PA", "ACA.PA", "BN.PA", "DSY.PA", "ENGI.PA", "EL.PA",
     "ERF.PA", "RMS.PA", "KER.PA", "LR.PA", "OR.PA", "MC.PA", "ML.PA",
     "ORA.PA", "RI.PA", "PUB.PA", "RNO.PA", "SAF.PA", "SGO.PA", "SAN.PA",
-    "SU.PA", "GLE.PA", "STLAM.MI", "STMPA.PA", "TEP.PA", "HO.PA",
-    "TTE.PA", "URW.AS", "VIE.PA", "DG.PA", "VIV.PA", "WLN.PA"
+    "SU.PA", "GLE.PA", "STLAM.PA", "STMPA.PA", "TEP.PA", "HO.PA",
+    "TTE.PA", "URW.PA", "VIE.PA", "DG.PA", "VIV.PA", "WLN.PA"
 ]
 
 # DAX 40 — Germany (Frankfurt)
@@ -72,7 +77,7 @@ FULL_UNIVERSE = list(set(CAC_40 + DAX_40 + FTSE_100 + STOXX_SUBSET))
 # INDEX BENCHMARKS (for market overview & beta calculation)
 # ============================================================================
 INDEX_TICKERS = {
-    "STOXX 600": "^STOXX",
+    "STOXX 600": "STOXX6E.SW",
     "CAC 40": "^FCHI",
     "DAX": "^GDAXI",
     "FTSE 100": "^FTSE",

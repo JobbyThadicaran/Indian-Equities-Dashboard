@@ -9,7 +9,7 @@ import numpy as np
 import pandas as pd
 from typing import Dict, Optional, Tuple
 
-from config import INDEX_TICKERS, START_DATE, END_DATE
+from config import INDEX_TICKERS
 from utils import (
     setup_logger, safe_divide, save_to_cache, load_from_cache, export_to_csv
 )
@@ -55,7 +55,7 @@ def compute_growth_metrics(financial_data: Dict[str, Dict]) -> pd.DataFrame:
                     record["revenue_current"] = curr_rev
                     record["revenue_previous"] = prev_rev
                     record["revenue_growth"] = safe_divide(
-                        (curr_rev - prev_rev), abs(prev_rev)
+                        (curr_rev - prev_rev), prev_rev
                     )
                     break
             
@@ -67,7 +67,7 @@ def compute_growth_metrics(financial_data: Dict[str, Dict]) -> pd.DataFrame:
                     record["ebitda_current"] = curr
                     record["ebitda_previous"] = prev_val
                     record["ebitda_growth"] = safe_divide(
-                        (curr - prev_val), abs(prev_val)
+                        (curr - prev_val), prev_val
                     )
                     break
             
@@ -79,7 +79,7 @@ def compute_growth_metrics(financial_data: Dict[str, Dict]) -> pd.DataFrame:
                     record["net_income_current"] = curr
                     record["net_income_previous"] = prev_val
                     record["earnings_growth"] = safe_divide(
-                        (curr - prev_val), abs(prev_val)
+                        (curr - prev_val), prev_val
                     )
                     break
             
@@ -134,6 +134,7 @@ def compute_profitability_metrics(financial_data: Dict[str, Dict]) -> pd.DataFra
         info = data.get("info", {})
         income = data.get("income_stmt", pd.DataFrame())
         balance = data.get("balance_sheet", pd.DataFrame())
+        net_income = None
         
         if not income.empty and income.shape[1] >= 1:
             latest = income.columns[0]
@@ -180,8 +181,8 @@ def compute_profitability_metrics(financial_data: Dict[str, Dict]) -> pd.DataFra
             if "Total Assets" in balance.index:
                 total_assets = balance.loc["Total Assets", latest_bs]
             
-            record["roe"] = safe_divide(net_income, total_equity) if 'net_income' in dir() else None
-            record["roa"] = safe_divide(net_income, total_assets) if 'net_income' in dir() else None
+            record["roe"] = safe_divide(net_income, total_equity) if net_income is not None else None
+            record["roa"] = safe_divide(net_income, total_assets) if net_income is not None else None
         
         # From yfinance info (as backup)
         record["roe_info"] = info.get("returnOnEquity")

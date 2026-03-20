@@ -2,30 +2,29 @@
 # ============================================
 
 # Data fetching
-yfinance
-akshare
-requests
-feedparser
-beautifulsoup4
+yfinance>=0.2.38,<0.3
+akshare>=1.12,<2.0
+requests>=2.31
+feedparser>=6.0
+beautifulsoup4>=4.12
 
 # Data processing & analytics
-pandas
-numpy
-scipy
+pandas>=2.0,<2.3
+numpy>=1.24
 
 # Sentiment analysis
-nltk
-vaderSentiment
+nltk>=3.8
+vaderSentiment>=3.3
 
 # Visualization
-plotly
-matplotlib
+plotly>=5.0
+matplotlib>=3.7
 
 # Dashboard
-streamlit
+streamlit>=1.35,<2.0
 
 # PDF report generation
-reportlab
+reportlab>=4.1,<5.0
 
 # Utilities
-tqdm
+tqdm>=4.0
