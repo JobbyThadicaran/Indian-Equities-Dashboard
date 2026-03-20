@@ -1,14 +1,13 @@
 """
-data_ingestion.py — Data Ingestion Module for European Equity Research
-======================================================================
+data_ingestion.py — Data Ingestion Module for Indian Equity Research
+====================================================================
 Fetches historical prices, financial statements, and valuation metrics
-for the European equity universe. Uses yfinance as primary source with
-akshare as fallback. Implements disk caching for offline use.
+for the Indian working universe. Prices and fundamentals come from
+yfinance, while the universe definition is built from NIFTY 50 plus
+F&O-eligible stocks discovered via Zerodha/public files.
 """
 
-import os
-import sys
-import time
+import hashlib
 import warnings
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Dict, List, Optional, Tuple
@@ -18,15 +17,11 @@ import pandas as pd
 import yfinance as yf
 from tqdm import tqdm
 
-try:
-    import akshare as ak
-except Exception:
-    ak = None
-
 from config import (
     FULL_UNIVERSE, get_date_range, DATA_DIR,
     INDEX_TICKERS, CACHE_EXPIRY_HOURS
 )
+from market_universe import build_india_universe
 from utils import (
     setup_logger, ensure_directories, save_to_cache,
     load_from_cache, safe_divide
@@ -34,6 +29,15 @@ from utils import (
 
 warnings.filterwarnings("ignore")
 logger = setup_logger("data_ingestion")
+
+
+def _universe_fingerprint(tickers: List[str]) -> str:
+    """Generate a stable cache suffix for a specific ticker set."""
+    unique = sorted(set(tickers))
+    if not unique:
+        return "empty"
+    digest = hashlib.sha1(",".join(unique).encode("utf-8")).hexdigest()[:12]
+    return f"{len(unique)}_{digest}"
 
 # ============================================================================
 # PRICE DATA FETCHING
@@ -62,7 +66,7 @@ def fetch_price_data(
     """
     if start is None or end is None:
         start, end, _ = get_date_range()
-    cache_key = f"prices_{start}_{end}"
+    cache_key = f"prices_{_universe_fingerprint(tickers)}_{start}_{end}"
     cached = load_from_cache(cache_key)
     if cached is not None and len(cached) > 0:
         logger.info(f"Loaded price data from cache ({len(cached)} tickers)")
@@ -117,9 +121,7 @@ def fetch_index_data(
     end: str = None
 ) -> Dict[str, pd.DataFrame]:
     """
-    Fetch historical data for European market indices.
-    
-    Uses yfinance primarily and akshare as a fallback.
+    Fetch historical data for Indian market indices via yfinance.
     
     Args:
         start: Start date
@@ -138,62 +140,20 @@ def fetch_index_data(
     
     logger.info("Fetching index benchmark data")
     index_data = {}
-    
-    # Mapping for Akshare symbols (requires Chinese names for global indices)
-    ak_idx_map = {
-        "英国富时100指数": "FTSE 100",
-        "德国DAX 30种股价指数": "DAX",
-        "法CAC40指数": "CAC 40",
-        "欧洲Stoxx50指数": "Euro STOXX 50"
-    }
-    
+
     for name, ticker in INDEX_TICKERS.items():
         try:
-            logger.info(f"Fetching {name} via yfinance...")
+            logger.info(f"Fetching {name} via yfinance")
             df = yf.Ticker(ticker).history(start=start, end=end, auto_adjust=True)
             if df is not None and not df.empty:
                 df.index = pd.to_datetime(df.index)
                 df.index = df.index.tz_localize(None)
                 index_data[name] = df
-                logger.info(f"  ✓ {name} (yf): {len(df)} data points")
+                logger.info(f"  ✓ {name}: {len(df)} data points")
             else:
-                raise ValueError("Empty yf dataframe")
+                logger.warning(f"  ✗ {name}: empty dataframe")
         except Exception as e:
-            logger.warning(f"  ✗ {name} (yf) failed: {e}. Trying Akshare...")
-            if ak is None:
-                logger.warning(f"  ✗ {name}: Akshare unavailable in this environment")
-                continue
-            try:
-                # Find Akshare symbol
-                ak_sym = None
-                for sym, label in ak_idx_map.items():
-                    if label == name:
-                        ak_sym = sym
-                        break
-                
-                if ak_sym:
-                    df_ak = ak.index_global_hist_sina(symbol=ak_sym)
-                    if df_ak is not None and not df_ak.empty:
-                        # Akshare returns [date, open, high, low, close, volume]
-                        df_ak = df_ak.rename(columns={
-                            df_ak.columns[0]: "Date",
-                            df_ak.columns[1]: "Open", df_ak.columns[2]: "High",
-                            df_ak.columns[3]: "Low",  df_ak.columns[4]: "Close",
-                            df_ak.columns[5]: "Volume"
-                        })
-                        df_ak = df_ak.set_index("Date")
-                        df_ak.index = pd.to_datetime(df_ak.index)
-                        
-                        # Filter by date
-                        df_ak = df_ak.loc[start:end]
-                        index_data[name] = df_ak
-                        logger.info(f"  ✓ {name} (ak): {len(df_ak)} data points")
-                    else:
-                        logger.warning(f"  ✗ {name} (ak) also empty")
-                else:
-                    logger.warning(f"  ✗ No Akshare symbol mapped for {name}")
-            except Exception as e2:
-                logger.error(f"  ✗ {name} (ak) fatal error: {e2}")
+            logger.warning(f"  ✗ {name}: {e}")
     
     save_to_cache(cache_key, index_data)
     return index_data
@@ -220,7 +180,7 @@ def fetch_financial_data(
             'info', 'income_stmt', 'balance_sheet', 'cashflow',
             'quarterly_income', 'quarterly_balance', 'quarterly_cashflow'
     """
-    cache_key = "financials_data"
+    cache_key = f"financials_data_{_universe_fingerprint(tickers)}"
     cached = load_from_cache(cache_key)
     if cached is not None and len(cached) > 0:
         logger.info(f"Loaded financial data from cache ({len(cached)} tickers)")
@@ -283,6 +243,7 @@ def fetch_financial_data(
 def extract_key_metrics(
     financial_data: Dict[str, Dict],
     price_data: Dict[str, pd.DataFrame],
+    universe_metadata: Optional[pd.DataFrame] = None,
     start: str = None,
     end: str = None
 ) -> pd.DataFrame:
@@ -308,7 +269,7 @@ def extract_key_metrics(
     # Check cache first
     if start is None or end is None:
         start, end, _ = get_date_range()
-    cache_key = f"key_metrics_{start}_{end}"
+    cache_key = f"key_metrics_{_universe_fingerprint(list(financial_data.keys()))}_{start}_{end}"
     cached = load_from_cache(cache_key)
     if cached is not None and len(cached) > 0:
         logger.info(f"Loaded key metrics from cache ({len(cached)} stocks)")
@@ -497,6 +458,22 @@ def extract_key_metrics(
         return pd.DataFrame()
     
     df = pd.DataFrame(records).set_index("ticker")
+
+    if universe_metadata is not None and not universe_metadata.empty:
+        metadata = universe_metadata.reindex(df.index)
+        for col in ["symbol", "company_name", "country", "is_nifty50", "is_fo_eligible", "universe_bucket", "universe_source"]:
+            if col in metadata.columns:
+                df[col] = metadata[col]
+
+        if "sector" in metadata.columns:
+            if "sector" in df.columns:
+                df["sector"] = df["sector"].replace("Unknown", pd.NA).fillna(metadata["sector"])
+            else:
+                df["sector"] = metadata["sector"]
+
+        if "company_name" in metadata.columns:
+            missing_name = df["name"].isna() | df["name"].eq(df.index)
+            df.loc[missing_name, "name"] = metadata.loc[missing_name, "company_name"]
     
     # Ensure numeric columns are indeed numeric (yfinance sometimes returns strings/None)
     numeric_cols = [
@@ -544,9 +521,18 @@ def run_data_pipeline(
     ensure_directories()
     if start is None or end is None:
         start, end, _ = get_date_range()
-    
+
+    universe_metadata = build_india_universe()
     if universe is None:
+        universe = universe_metadata.index.tolist()
+    else:
+        universe = list(universe)
+        if universe_metadata is not None and not universe_metadata.empty:
+            universe_metadata = universe_metadata.reindex(universe)
+
+    if not universe:
         universe = FULL_UNIVERSE
+        universe_metadata = build_india_universe().reindex(universe)
     
     logger.info("=" * 60)
     logger.info("STARTING DATA INGESTION PIPELINE")
@@ -565,7 +551,13 @@ def run_data_pipeline(
     financial_data = fetch_financial_data(valid_tickers)
     
     # Step 4: Extract metrics
-    metrics_df = extract_key_metrics(financial_data, price_data, start, end)
+    metrics_df = extract_key_metrics(
+        financial_data,
+        price_data,
+        universe_metadata=universe_metadata,
+        start=start,
+        end=end,
+    )
     
     logger.info("=" * 60)
     logger.info("DATA INGESTION COMPLETE")

@@ -1,6 +1,6 @@
 """
-app.py — Streamlit Dashboard for European Long/Short Equity Research
-=====================================================================
+app.py — Streamlit Dashboard for Indian Long/Short Equity Research
+==================================================================
 Interactive dashboard with market overview, long/short ideas,
 stock drill-down, sentiment analysis, and report generation.
 """
@@ -17,10 +17,7 @@ import plotly.graph_objects as go
 import plotly.express as px
 from plotly.subplots import make_subplots
 
-from config import (
-    FULL_UNIVERSE, CAC_40, DAX_40, FTSE_100, STOXX_SUBSET,
-    FACTOR_WEIGHTS, COUNTRY_MAP
-)
+from config import MARKET_NAME, SHORT_BOOK_DESCRIPTION, UNIVERSE_DESCRIPTION
 from utils import (
     fmt_pct, fmt_number, fmt_large_number, fmt_ratio,
     ticker_to_name, load_from_cache, ensure_directories
@@ -31,7 +28,7 @@ from utils import (
 # ============================================================================
 
 st.set_page_config(
-    page_title="European L/S Equity Research",
+    page_title="Indian L/S Equity Research",
     page_icon="📊",
     layout="wide",
     initial_sidebar_state="expanded"
@@ -172,10 +169,10 @@ def load_all_data():
                 sentiment_df[available], how="left"
             )
     
-    # Add country mapping
-    scored_universe["country"] = scored_universe.index.map(
-        lambda t: COUNTRY_MAP.get(t, "Other")
-    )
+    if "country" not in scored_universe.columns:
+        scored_universe["country"] = MARKET_NAME
+    else:
+        scored_universe["country"] = scored_universe["country"].fillna(MARKET_NAME)
     
     return {
         "price_data": price_data,
@@ -261,12 +258,13 @@ def render_sidebar(data):
     
     scored = data["scored_universe"]
     
-    # Country filter
-    countries = sorted(scored["country"].dropna().unique())
-    selected_countries = st.sidebar.multiselect(
-        "Country", countries, default=countries,
-        key="country_filter"
-    )
+    selected_buckets = None
+    if "universe_bucket" in scored.columns:
+        buckets = sorted(scored["universe_bucket"].dropna().unique())
+        selected_buckets = st.sidebar.multiselect(
+            "Universe Bucket", buckets, default=buckets,
+            key="universe_bucket_filter"
+        )
     
     # Sector filter
     if "sector" in scored.columns:
@@ -288,6 +286,15 @@ def render_sidebar(data):
         )
     else:
         score_range = (0, 100)
+
+    fo_only = False
+    if "is_fo_eligible" in scored.columns:
+        fo_only = st.sidebar.checkbox(
+            "Show F&O-eligible only",
+            value=False,
+            help="Limit the table and idea views to names that are shortable / optionable.",
+            key="fo_only_filter"
+        )
     
     st.sidebar.markdown("---")
     st.sidebar.markdown("## ⚙️ Actions")
@@ -309,9 +316,10 @@ def render_sidebar(data):
     )
     
     return {
-        "countries": selected_countries,
+        "universe_buckets": selected_buckets,
         "sectors": selected_sectors,
         "score_range": score_range,
+        "fo_only": fo_only,
         "generate_report": generate_report,
     }
 
@@ -320,13 +328,15 @@ def apply_filters(scored, filters):
     """Apply sidebar filters to the scored universe."""
     filtered = scored.copy()
     
-    # Country filter
-    if filters["countries"]:
-        filtered = filtered[filtered["country"].isin(filters["countries"])]
+    if filters["universe_buckets"] and "universe_bucket" in filtered.columns:
+        filtered = filtered[filtered["universe_bucket"].isin(filters["universe_buckets"])]
     
     # Sector filter
     if filters["sectors"] and "sector" in filtered.columns:
         filtered = filtered[filtered["sector"].isin(filters["sectors"])]
+
+    if filters["fo_only"] and "is_fo_eligible" in filtered.columns:
+        filtered = filtered[filtered["is_fo_eligible"].fillna(False)]
     
     # Score range
     if "composite_score" in filtered.columns:
@@ -475,6 +485,7 @@ def render_portfolio_ideas(data, filtered):
             '🔴 Top Short Ideas</div>',
             unsafe_allow_html=True
         )
+        st.caption(SHORT_BOOK_DESCRIPTION)
         
         if len(short_book) > 0:
             for ticker, row in short_book.head(10).iterrows():
@@ -775,9 +786,10 @@ def render_universe_table(filtered):
     )
     
     display_cols = [
-        "name", "position", "composite_score", "value_score",
+        "symbol", "name", "position", "composite_score", "value_score",
         "quality_score", "momentum_score", "pe_ratio", "ev_ebitda",
-        "ebitda_margin", "volatility", "mom_3m", "sentiment_score", "country"
+        "ebitda_margin", "volatility", "mom_3m", "sentiment_score",
+        "universe_bucket", "is_fo_eligible"
     ]
     available = [c for c in display_cols if c in filtered.columns]
     
@@ -811,14 +823,19 @@ def render_universe_table(filtered):
         
         # Rename columns for display
         rename_map = {
-            "name": "Name", "position": "Position", "composite_score": "Score",
+            "symbol": "Symbol", "name": "Name", "position": "Position", "composite_score": "Score",
             "value_score": "Value", "quality_score": "Quality",
             "momentum_score": "Momentum", "pe_ratio": "P/E",
             "ev_ebitda": "EV/EBITDA", "ebitda_margin": "EBITDA Margin",
             "volatility": "Volatility", "mom_3m": "3M Return",
-            "sentiment_score": "Sentiment", "country": "Country"
+            "sentiment_score": "Sentiment", "universe_bucket": "Universe",
+            "is_fo_eligible": "F&O Eligible"
         }
         display_df = display_df.rename(columns=rename_map)
+        if "F&O Eligible" in display_df.columns:
+            display_df["F&O Eligible"] = display_df["F&O Eligible"].map(
+                lambda value: "Yes" if pd.notna(value) and bool(value) else "No"
+            )
         
         st.dataframe(
             display_df,
@@ -844,7 +861,7 @@ def render_universe_table(filtered):
 
 def handle_report_generation(data):
     """Handle PDF report generation via the sidebar button."""
-    with st.spinner("Generating hedge fund-style PDF report..."):
+    with st.spinner("Generating India market PDF report..."):
         try:
             from report_generator import generate_report
             from factor_model import suggest_relative_trades
@@ -891,11 +908,10 @@ def main():
     """Main application entry point."""
     # Title
     st.markdown(
-        "# 📊 European Long/Short Equity Research"
+        "# 📊 Indian Long/Short Equity Research"
     )
     st.markdown(
-        "_Systematic factor-based analysis of European equities — "
-        "Value · Quality · Momentum_"
+        f"_{UNIVERSE_DESCRIPTION} with Value · Quality · Momentum scoring_"
     )
     st.markdown("---")
     
@@ -909,7 +925,7 @@ def main():
     # Sidebar filters
     if data["scored_universe"].empty:
         st.warning("⚠️ No stock data available in cache. Fetching market data for the first time...")
-        st.info("The initial data ingestion for 180+ stocks can take 3-5 minutes. Please wait and click 'Refresh' below once complete.")
+        st.info("The initial NIFTY 50 + F&O universe fetch can take a few minutes. Please wait and click 'Refresh' below once complete.")
         if st.button("Refresh Now", key="refresh_empty"):
             st.cache_data.clear()
             st.rerun()

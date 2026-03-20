@@ -3,7 +3,8 @@ backtesting.py — Strategy Backtesting & Performance Tracking Module
 ====================================================================
 Simulates the long/short factor strategy over historical data with
 monthly rebalancing. Computes portfolio performance metrics and exports
-results for analysis.
+results for analysis. In the Indian setup, the short leg is restricted
+to F&O-eligible names when that metadata is available.
 """
 
 import numpy as np
@@ -116,6 +117,8 @@ class BacktestEngine:
         for col in ["pe_ratio", "ev_ebitda", "fcf_yield", "roic", "ebitda_margin", "leverage"]:
             if col in self.metrics_df.columns:
                 scores[col] = self.metrics_df[col]
+        if "is_fo_eligible" in self.metrics_df.columns:
+            scores["is_fo_eligible"] = self.metrics_df["is_fo_eligible"]
         
         # Rank factors
         if "pe_ratio" in scores:
@@ -220,14 +223,24 @@ class BacktestEngine:
             
             # Select LONG and SHORT positions
             long_thresh = np.percentile(valid_scores["composite_score"], self.long_pct)
-            short_thresh = np.percentile(valid_scores["composite_score"], self.short_pct)
+            short_scores = valid_scores
+            if "is_fo_eligible" in valid_scores.columns:
+                eligible = valid_scores[valid_scores["is_fo_eligible"].fillna(False)]
+                if not eligible.empty:
+                    short_scores = eligible
+                else:
+                    short_scores = pd.DataFrame(columns=valid_scores.columns)
             
             new_longs = valid_scores[
                 valid_scores["composite_score"] >= long_thresh
             ].index.tolist()
-            new_shorts = valid_scores[
-                valid_scores["composite_score"] <= short_thresh
-            ].index.tolist()
+            if short_scores.empty:
+                new_shorts = []
+            else:
+                short_thresh = np.percentile(short_scores["composite_score"], self.short_pct)
+                new_shorts = short_scores[
+                    short_scores["composite_score"] <= short_thresh
+                ].index.tolist()
             
             # Log rebalance
             rebalance_log.append({

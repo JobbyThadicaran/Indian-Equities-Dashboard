@@ -214,7 +214,7 @@ def compute_risk_metrics(
         - Annualised Volatility
         - Max Drawdown
         - Max Drawdown Duration (days)
-        - Beta (vs STOXX 600 or FTSE 100 benchmark)
+        - Beta (vs NIFTY 50 / NIFTY Bank / Sensex benchmark)
         - Sharpe Ratio (annualised, rf=0 assumed)
         - Sortino Ratio
         - Skewness
@@ -233,7 +233,7 @@ def compute_risk_metrics(
     # Get benchmark returns for beta calculation
     benchmark_returns = None
     if index_data:
-        for bench_name in ["STOXX 600", "Euro STOXX 50", "FTSE 100"]:
+        for bench_name in ["NIFTY 50", "NIFTY Bank", "BSE Sensex"]:
             if bench_name in index_data:
                 benchmark_returns = index_data[bench_name]["Close"].pct_change().dropna()
                 logger.info(f"Using {bench_name} as benchmark for beta calculation")

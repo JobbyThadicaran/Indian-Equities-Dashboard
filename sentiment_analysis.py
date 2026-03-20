@@ -3,7 +3,7 @@ sentiment_analysis.py — News Fetching & Sentiment Analysis Module
 =================================================================
 Fetches financial news via RSS feeds, performs VADER sentiment analysis,
 and detects key event keywords (earnings beat/miss, guidance changes, etc.)
-for each stock in the European equity universe.
+for each stock in the Indian working universe.
 """
 
 import re
@@ -187,7 +187,7 @@ def fetch_ticker_news(
     # Method 2: Google News RSS
     try:
         company_name = build_search_name(ticker_name or ticker_to_name(ticker), ticker)
-        search_query = f"\"{company_name}\" stock"
+        search_query = f"\"{company_name}\" India stock NSE"
         google_rss_url = f"https://news.google.com/rss/search?q={quote(search_query)}+when:7d&hl=en"
         
         # Google News blocks direct feedparser requests, use requests with User-Agent

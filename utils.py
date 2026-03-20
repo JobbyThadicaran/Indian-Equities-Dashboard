@@ -1,6 +1,6 @@
 """
-utils.py — Shared Utilities for European Long/Short Equity Research System
-==========================================================================
+utils.py — Shared Utilities for Indian Long/Short Equity Research System
+========================================================================
 Provides caching, formatting, CSV export, logging, and common helper
 functions used across all modules.
 """

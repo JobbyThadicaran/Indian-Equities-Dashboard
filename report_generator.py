@@ -9,6 +9,7 @@ Uses ReportLab for full layout control.
 import os
 import io
 import re
+import hashlib
 from datetime import datetime
 from typing import Dict, List, Optional, Tuple
 
@@ -18,6 +19,21 @@ import matplotlib
 matplotlib.use("Agg")  # Non-interactive backend for server/headless environments
 import matplotlib.pyplot as plt
 import matplotlib.dates as mdates
+
+
+_ORIGINAL_MD5 = hashlib.md5
+
+
+def _compat_md5(*args, **kwargs):
+    """Ignore `usedforsecurity` on older OpenSSL/Python builds."""
+    try:
+        return _ORIGINAL_MD5(*args, **kwargs)
+    except TypeError:
+        kwargs.pop("usedforsecurity", None)
+        return _ORIGINAL_MD5(*args, **kwargs)
+
+
+hashlib.md5 = _compat_md5
 
 from reportlab.lib import colors
 from reportlab.lib.pagesizes import A4
@@ -401,8 +417,9 @@ def build_cover_page(styles: Dict) -> List:
     elements.append(Spacer(1, 40))
     elements.append(Paragraph(
         "This report presents a systematic long/short equity strategy "
-        "applied to European markets. Stocks are scored using a multi-factor "
-        "model combining Value, Quality, and Momentum signals.",
+        "applied to Indian equities. Stocks are scored using a multi-factor "
+        "model combining Value, Quality, and Momentum signals, with the short "
+        "book restricted to F&O-eligible names.",
         styles["BodyText"]
     ))
     elements.append(Spacer(1, 200))
@@ -755,7 +772,7 @@ def generate_report(
     
     if output_filename is None:
         date_str = datetime.now().strftime("%Y%m%d_%H%M%S")
-        output_filename = f"european_ls_equity_report_{date_str}.pdf"
+        output_filename = f"indian_ls_equity_report_{date_str}.pdf"
     
     output_path = os.path.join(REPORTS_DIR, output_filename)
     styles = get_report_styles()

@@ -2,7 +2,7 @@
 factor_model.py — Multi-Factor Scoring Engine for Long/Short Portfolio Construction
 ====================================================================================
 Implements a systematic factor model combining Value, Quality, and Momentum
-factors. Scores the European equity universe, ranks stocks on a percentile
+factors. Scores the Indian working universe, ranks stocks on a percentile
 basis, and constructs long/short portfolios.
 """
 
@@ -12,7 +12,7 @@ from typing import Dict, List, Tuple, Optional
 
 from config import (
     FACTOR_WEIGHTS, LONG_THRESHOLD_PERCENTILE,
-    SHORT_THRESHOLD_PERCENTILE, COUNTRY_MAP
+    SHORT_THRESHOLD_PERCENTILE
 )
 from utils import (
     setup_logger, percentile_rank, winsorize,
@@ -237,19 +237,34 @@ def construct_portfolio(
     
     # Determine thresholds
     long_threshold = np.percentile(valid["composite_score"], long_pct)
-    short_threshold = np.percentile(valid["composite_score"], short_pct)
-    
+    short_candidates = valid
+    if "is_fo_eligible" in valid.columns:
+        eligible = valid[valid["is_fo_eligible"].fillna(False)]
+        if not eligible.empty:
+            short_candidates = eligible
+        else:
+            logger.warning("No F&O-eligible names available; short book left empty")
+            short_candidates = pd.DataFrame(columns=valid.columns)
+
     # Assign portfolio positions
     df["position"] = "NEUTRAL"
     df.loc[df["composite_score"] >= long_threshold, "position"] = "LONG"
-    df.loc[df["composite_score"] <= short_threshold, "position"] = "SHORT"
+    if not short_candidates.empty:
+        short_threshold = np.percentile(short_candidates["composite_score"], short_pct)
+        short_names = short_candidates[short_candidates["composite_score"] <= short_threshold].index
+        df.loc[df.index.isin(short_names), "position"] = "SHORT"
+    else:
+        short_threshold = np.nan
     
     long_book = df[df["position"] == "LONG"].sort_values("composite_score", ascending=False)
     short_book = df[df["position"] == "SHORT"].sort_values("composite_score", ascending=True)
     
     logger.info(f"Portfolio constructed:")
     logger.info(f"  LONG:    {len(long_book)} positions (score ≥ {long_threshold:.1f})")
-    logger.info(f"  SHORT:   {len(short_book)} positions (score ≤ {short_threshold:.1f})")
+    if not np.isnan(short_threshold):
+        logger.info(f"  SHORT:   {len(short_book)} positions (score ≤ {short_threshold:.1f})")
+    else:
+        logger.info("  SHORT:   0 positions (no F&O-eligible short universe)")
     logger.info(f"  NEUTRAL: {len(df) - len(long_book) - len(short_book)} positions")
     
     return df, long_book, short_book
@@ -327,6 +342,17 @@ def suggest_relative_trades(
         List of dicts with keys: 'long_ticker', 'short_ticker',
             'long_score', 'short_score', 'score_spread', 'sector'
     """
+    required_cols = {"composite_score"}
+    if (
+        long_book is None
+        or short_book is None
+        or long_book.empty
+        or short_book.empty
+        or not required_cols.issubset(long_book.columns)
+        or not required_cols.issubset(short_book.columns)
+    ):
+        return []
+
     pairs = []
     used_long = set()
     used_short = set()

@@ -1,165 +1,93 @@
-# European Long/Short Equity Research System
+# Indian Long/Short Equity Research System
 
-A production-quality, modular Python system for systematic long/short equity research on European markets. Built as a hedge fund prototype.
+Systematic factor-based long/short research for Indian equities using the same value, quality, and momentum logic as the original project, now applied to:
+
+- `NIFTY 50` constituents
+- `F&O-eligible` Indian stocks
+- an F&O-gated short book, so bearish ideas stay inside the tradable derivatives universe
+
+## What Changed
+
+- The working universe is now built dynamically as `NIFTY 50 ∪ F&O`.
+- Live F&O discovery prefers `Zerodha` instruments when `ZERODHA_ACCESS_TOKEN` is available.
+- If live Zerodha auth is unavailable, the app falls back to public NSE/Nifty files and then to a bundled NIFTY 50 fallback set.
+- The dashboard and PDF report now speak in Indian-market terms instead of the old Europe/country setup.
 
 ## Architecture
 
-```
-┌─────────────────────────────────────────────────────────────────┐
-│                    Streamlit Dashboard (app.py)                  │
-├──────────┬──────────┬──────────────┬───────────────────────────-─┤
-│ Market   │ Long/    │  Stock       │   Universe                  │
-│ Overview │ Short    │  Drill-Down  │   Table                     │
-├──────────┴──────────┴──────────────┴────────────────────────────-┤
-│                                                                  │
-│  ┌──────────────┐  ┌───────────────┐  ┌──────────────────────┐  │
-│  │ Factor Model │  │  Financial    │  │ Sentiment Analysis   │  │
-│  │ (Scoring)    │  │  Analysis     │  │ (News + NLP)         │  │
-│  └──────┬───────┘  └───────┬───────┘  └──────────┬───────────┘  │
-│         │                  │                      │              │
-│  ┌──────┴──────────────────┴──────────────────────┴───────────┐  │
-│  │              Data Ingestion (yfinance + cache)              │  │
-│  └─────────────────────────────────────────────────────────────┘  │
-│                                                                  │
-│  ┌────────────────┐  ┌──────────────────────────────────────-─┐  │
-│  │  Backtesting   │  │    PDF Report Generator (ReportLab)    │  │
-│  └────────────────┘  └────────────────────────────────────────┘  │
-└──────────────────────────────────────────────────────────────────┘
-```
-
-## Modules
-
-| Module | Description |
-|---|---|
-| `config.py` | Universe definitions (CAC 40, DAX 40, FTSE 100, STOXX subset), factor weights, sentiment keywords, constants |
-| `data_ingestion.py` | Fetches prices + financials via yfinance (primary) and Akshare (fallback for indices) with parallel threading and disk caching |
-| `factor_model.py` | Multi-factor scoring engine (Value, Quality, Momentum), percentile ranking, portfolio construction |
-| `financial_analysis.py` | Growth, Profitability, Risk, Valuation analytics per stock |
-| `sentiment_analysis.py` | RSS news fetching, VADER sentiment scoring, event keyword detection |
-| `backtesting.py` | Monthly rebalance strategy simulation with performance metrics |
-| `report_generator.py` | Professional PDF report generation via ReportLab |
-| `app.py` | Interactive Streamlit dashboard with Plotly charts |
-| `utils.py` | Shared helpers: caching, formatting, export, logging |
-
-## Factor Model
-
-### Scoring System
-
-| Category | Factor | Weight | Direction |
-|---|---|---|---|
-| **Value** | P/E Ratio | 12% | Lower is better |
-| **Value** | EV/EBITDA | 12% | Lower is better |
-| **Value** | FCF Yield | 11% | Higher is better |
-| **Quality** | ROIC | 12% | Higher is better |
-| **Quality** | EBITDA Margin | 12% | Higher is better |
-| **Quality** | Net Debt/EBITDA | 11% | Lower is better |
-| **Momentum** | 3-Month Return | 15% | Higher is better |
-| **Momentum** | 6-Month Return | 15% | Higher is better |
-
-### Portfolio Construction
-- **LONG**: Top 10% composite score → Stocks with strongest combined factor signal
-- **SHORT**: Bottom 10% composite score → Stocks with weakest combined factor signal
+- `market_universe.py`: Builds the India universe and contains Zerodha auth helpers.
+- `data_ingestion.py`: Fetches price/fundamental data and merges universe metadata.
+- `factor_model.py`: Scores the universe and restricts shorts to F&O-eligible names.
+- `backtesting.py`: Applies the same F&O short-side restriction in historical simulation.
+- `sentiment_analysis.py`: News and sentiment for the Indian equity universe.
+- `app.py`: Streamlit dashboard.
+- `report_generator.py`: PDF report generation.
 
 ## Setup
 
-### Prerequisites
-- Python 3.9+
-- Internet connection (for data fetching)
-
-### Installation
-
 ```bash
-# Clone / navigate to the project
-cd "hedge Fund Analysis"
-
-# Create virtual environment (recommended)
 python3 -m venv venv
 source venv/bin/activate
-
-# Install dependencies
 pip install -r requirements.txt
-
-# Download NLTK data (for sentiment analysis)
 python3 -c "import nltk; nltk.download('vader_lexicon')"
 ```
 
-## Usage
+## Zerodha Auth
 
-### 1. Run the full Streamlit Dashboard
+Zerodha live endpoints require an `access token`. `API key` + `API secret` alone are not enough.
+
+1. Export your credentials:
+
+```bash
+export ZERODHA_API_KEY="your_api_key"
+export ZERODHA_API_SECRET="your_api_secret"
+```
+
+2. Get the login URL:
+
+```bash
+python3 scripts/zerodha_auth.py
+```
+
+3. After Zerodha redirects you back, copy the `request_token` from the URL and exchange it:
+
+```bash
+python3 scripts/zerodha_auth.py --request-token "<request_token>"
+```
+
+4. Export the returned access token:
+
+```bash
+export ZERODHA_ACCESS_TOKEN="your_access_token"
+```
+
+If you skip this, the app still runs using public NSE/Nifty universe discovery.
+
+## Run
 
 ```bash
 streamlit run app.py
 ```
 
-This launches the interactive dashboard at `http://localhost:8501` with:
-- **Market Overview** — European index performance with interactive charts
-- **Long/Short Ideas** — Top-ranked stocks with factor breakdowns
-- **Stock Drill-Down** — Candlestick chart, radar factor chart, sentiment, key metrics
-- **Universe Table** — Sortable/filterable table of all scored stocks
+The dashboard includes:
 
-### 2. Run individual modules
+- `Market Overview`: NIFTY / Bank Nifty / Sensex performance
+- `Long/Short Ideas`: factor-ranked longs and F&O-eligible shorts
+- `Stock Drill-Down`: chart, factor breakdown, key metrics, sentiment
+- `Universe Table`: sortable view with universe bucket and F&O eligibility
 
-```bash
-# Data ingestion only
-python3 data_ingestion.py
+## Reports
 
-# Factor model + portfolio construction
-python3 factor_model.py
-
-# Financial analysis
-python3 financial_analysis.py
-
-# Sentiment analysis
-python3 sentiment_analysis.py
-
-# Backtesting
-python3 backtesting.py
-
-# PDF report generation
-python3 report_generator.py
-```
-
-### 3. Generate PDF Report
-
-Via the dashboard sidebar button, or standalone:
+Generate from the sidebar or run:
 
 ```bash
 python3 report_generator.py
 ```
 
-Output is saved to `reports/european_ls_equity_report_<timestamp>.pdf`.
-
-### 4. Backtesting
-
-```bash
-python3 backtesting.py
-```
-
-Runs a monthly rebalance simulation, outputs:
-- Portfolio/long/short cumulative returns
-- Sharpe, Sortino, Calmar ratios
-- Max drawdown, hit rate
-- CSV export to `exports/`
-
-## Output Directories
-
-| Directory | Contents |
-|---|---|
-| `data/` | Cached price and financial data (pickle) |
-| `reports/` | Generated PDF reports and charts |
-| `exports/` | CSV exports of metrics, scores, performance |
-| `logs/` | Module-level log files |
-
-## Data Sources
-
-- **yfinance** — Historical prices, financial statements, valuation metrics
-- **Akshare** — Fallback for European market indices (FTSE 100, DAX, CAC 40, Euro STOXX 50)
-- **RSS Feeds** — Financial news from Yahoo Finance, Reuters, MarketWatch, CNBC
-- **VADER** — Sentiment scoring via vaderSentiment library
+Output is written to `reports/indian_ls_equity_report_<timestamp>.pdf`.
 
 ## Notes
 
-- First run takes 5-10 minutes to download data for the full universe (~180 stocks)
-- Subsequent runs use cached data (12-hour expiry by default)
-- Factor weights are configurable in `config.py`
-- The system gracefully handles missing data by filling with neutral scores
+- Cache keys are now universe-aware, so India runs do not collide with the old Europe caches.
+- Public market files can fail or throttle; the pipeline degrades to fallback universes instead of stopping.
+- Short ideas are selected only from F&O-eligible names when that metadata is available.
