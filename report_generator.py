@@ -1,31 +1,31 @@
 """
-report_generator.py — Hedge Fund-Style PDF Report Generator
-=============================================================
-Generates professional PDF reports with market overview, long/short
-ideas with thesis and financials, relative trades, charts, and tables.
-Uses ReportLab for full layout control.
+report_generator.py - Markdown-first Indian equity research report generator
+===========================================================================
+Builds a detailed markdown research report and a styled PDF companion from
+the live factor model outputs used by the dashboard.
 """
 
-import os
-import io
-import re
-import hashlib
-from datetime import datetime
-from typing import Dict, List, Optional, Tuple
+from __future__ import annotations
 
-import numpy as np
+import hashlib
+import html
+import os
+from datetime import datetime
+from typing import Dict, List, Optional
+
 import pandas as pd
-import matplotlib
-matplotlib.use("Agg")  # Non-interactive backend for server/headless environments
-import matplotlib.pyplot as plt
-import matplotlib.dates as mdates
+
+from config import REPORTS_DIR, TOP_N_LONG, TOP_N_SHORT
+from utils import ensure_directories, fmt_large_number, setup_logger, ticker_to_name
+
+logger = setup_logger("report_generator")
 
 
 _ORIGINAL_MD5 = hashlib.md5
 
 
 def _compat_md5(*args, **kwargs):
-    """Ignore `usedforsecurity` on older OpenSSL/Python builds."""
+    """Ignore `usedforsecurity` on Python/OpenSSL builds that reject it."""
     try:
         return _ORIGINAL_MD5(*args, **kwargs)
     except TypeError:
@@ -35,712 +35,951 @@ def _compat_md5(*args, **kwargs):
 
 hashlib.md5 = _compat_md5
 
-from reportlab.lib import colors
-from reportlab.lib.pagesizes import A4
-from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
-from reportlab.lib.units import mm, inch
-from reportlab.lib.enums import TA_LEFT, TA_CENTER, TA_RIGHT, TA_JUSTIFY
-from reportlab.platypus import (
-    SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle,
-    Image, PageBreak, HRFlowable, KeepTogether
-)
-from reportlab.graphics.shapes import Drawing, Line
+try:
+    from reportlab.lib import colors
+    from reportlab.lib.pagesizes import A4
+    from reportlab.lib.styles import ParagraphStyle, getSampleStyleSheet
+    from reportlab.lib.units import mm
+    from reportlab.platypus import HRFlowable, Paragraph, SimpleDocTemplate, Spacer, Table, TableStyle
 
-from config import (
-    REPORT_TITLE, REPORT_SUBTITLE, REPORTS_DIR,
-    TOP_N_LONG, TOP_N_SHORT
-)
-from utils import (
-    setup_logger, ensure_directories, fmt_pct, fmt_number,
-    fmt_large_number, fmt_ratio, ticker_to_name
-)
-
-logger = setup_logger("report_generator")
-
-# ============================================================================
-# COLOUR PALETTE
-# ============================================================================
-NAVY = colors.HexColor("#1a1a2e")
-DARK_BLUE = colors.HexColor("#16213e")
-ACCENT_BLUE = colors.HexColor("#0f3460")
-ACCENT_TEAL = colors.HexColor("#53a8b6")
-LIGHT_GREY = colors.HexColor("#f5f5f5")
-MID_GREY = colors.HexColor("#cccccc")
-GREEN = colors.HexColor("#27ae60")
-RED = colors.HexColor("#e74c3c")
-GOLD = colors.HexColor("#f39c12")
-
-# ============================================================================
-# CUSTOM STYLES
-# ============================================================================
-
-def get_report_styles() -> Dict[str, ParagraphStyle]:
-    """Create custom paragraph styles for the report."""
-    base = getSampleStyleSheet()
-    
-    styles = {
-        "CoverTitle": ParagraphStyle(
-            "CoverTitle", parent=base["Title"],
-            fontSize=28, leading=34, textColor=NAVY,
-            spaceAfter=6, fontName="Helvetica-Bold"
-        ),
-        "CoverSubtitle": ParagraphStyle(
-            "CoverSubtitle", parent=base["Normal"],
-            fontSize=14, leading=18, textColor=ACCENT_BLUE,
-            spaceAfter=20, fontName="Helvetica"
-        ),
-        "CoverDate": ParagraphStyle(
-            "CoverDate", parent=base["Normal"],
-            fontSize=11, textColor=colors.grey,
-            fontName="Helvetica-Oblique"
-        ),
-        "SectionTitle": ParagraphStyle(
-            "SectionTitle", parent=base["Heading1"],
-            fontSize=18, leading=22, textColor=NAVY,
-            spaceBefore=16, spaceAfter=10,
-            fontName="Helvetica-Bold",
-            borderWidth=0, borderColor=ACCENT_TEAL,
-            borderPadding=4
-        ),
-        "SubsectionTitle": ParagraphStyle(
-            "SubsectionTitle", parent=base["Heading2"],
-            fontSize=14, leading=17, textColor=ACCENT_BLUE,
-            spaceBefore=12, spaceAfter=6,
-            fontName="Helvetica-Bold"
-        ),
-        "StockTitle": ParagraphStyle(
-            "StockTitle", parent=base["Heading3"],
-            fontSize=13, leading=16, textColor=NAVY,
-            spaceBefore=8, spaceAfter=4,
-            fontName="Helvetica-Bold"
-        ),
-        "BodyText": ParagraphStyle(
-            "BodyText", parent=base["Normal"],
-            fontSize=10, leading=14, textColor=colors.black,
-            alignment=TA_JUSTIFY, fontName="Helvetica",
-            spaceAfter=6
-        ),
-        "BulletText": ParagraphStyle(
-            "BulletText", parent=base["Normal"],
-            fontSize=10, leading=13, textColor=colors.black,
-            leftIndent=15, fontName="Helvetica",
-            spaceAfter=3
-        ),
-        "MetricLabel": ParagraphStyle(
-            "MetricLabel", parent=base["Normal"],
-            fontSize=9, textColor=colors.grey,
-            fontName="Helvetica"
-        ),
-        "MetricValue": ParagraphStyle(
-            "MetricValue", parent=base["Normal"],
-            fontSize=11, textColor=NAVY,
-            fontName="Helvetica-Bold"
-        ),
-        "Disclaimer": ParagraphStyle(
-            "Disclaimer", parent=base["Normal"],
-            fontSize=7, leading=9, textColor=colors.grey,
-            fontName="Helvetica-Oblique", alignment=TA_CENTER
-        ),
-        "Footer": ParagraphStyle(
-            "Footer", parent=base["Normal"],
-            fontSize=8, textColor=colors.grey,
-            fontName="Helvetica", alignment=TA_CENTER
-        ),
-    }
-    return styles
+    REPORTLAB_AVAILABLE = True
+    REPORTLAB_IMPORT_ERROR = None
+except Exception as exc:  # pragma: no cover - optional runtime dependency guard
+    REPORTLAB_AVAILABLE = False
+    REPORTLAB_IMPORT_ERROR = exc
 
 
-# ============================================================================
-# CHART GENERATION (Matplotlib → ReportLab Image)
-# ============================================================================
-
-def create_price_chart(
-    price_series: pd.Series,
-    title: str = "",
-    figsize: Tuple = (6, 2.5)
-) -> Optional[str]:
-    """
-    Generate a price chart and save as a temporary PNG for PDF embedding.
-    
-    Args:
-        price_series: Series with datetime index and price values
-        title: Chart title
-        figsize: Figure dimensions
-    
-    Returns:
-        Path to the saved PNG file
-    """
+def _coerce_float(value: object, default: float = 50.0) -> float:
     try:
-        fig, ax = plt.subplots(figsize=figsize)
-        ax.plot(price_series.index, price_series.values, color="#0f3460", linewidth=1.5)
-        ax.fill_between(price_series.index, price_series.values,
-                        alpha=0.1, color="#53a8b6")
-        ax.set_title(title, fontsize=10, fontweight="bold", color="#1a1a2e")
-        ax.grid(True, alpha=0.3, linestyle="--")
-        ax.xaxis.set_major_formatter(mdates.DateFormatter("%b %y"))
-        ax.xaxis.set_major_locator(mdates.MonthLocator(interval=2))
-        plt.xticks(fontsize=8, rotation=45)
-        plt.yticks(fontsize=8)
-        plt.tight_layout()
-        
-        safe_title = re.sub(r'[^a-zA-Z0-9_\-]', '_', title)[:30]
-        path = os.path.join(REPORTS_DIR, f"chart_{safe_title}.png")
-        fig.savefig(path, dpi=150, bbox_inches="tight")
-        plt.close(fig)
-        return path
-    except Exception as e:
-        logger.warning(f"Chart generation failed: {e}")
-        return None
+        if value is None or pd.isna(value):
+            return default
+        return float(value)
+    except Exception:
+        return default
 
 
-def create_factor_breakdown_chart(
-    scores: Dict[str, float],
-    title: str = "Factor Breakdown",
-    figsize: Tuple = (4, 3)
-) -> Optional[str]:
-    """
-    Create a horizontal bar chart showing factor score breakdown.
-    
-    Args:
-        scores: Dict mapping factor name → score
-        title: Chart title
-        figsize: Figure dimensions
-    
-    Returns:
-        Path to saved PNG
-    """
-    try:
-        fig, ax = plt.subplots(figsize=figsize)
-        factors = list(scores.keys())
-        values = list(scores.values())
-        bar_colors = ["#27ae60" if v >= 50 else "#e74c3c" for v in values]
-        
-        y_pos = range(len(factors))
-        ax.barh(y_pos, values, color=bar_colors, height=0.6, alpha=0.85)
-        ax.set_yticks(y_pos)
-        ax.set_yticklabels(factors, fontsize=8)
-        ax.set_xlim(0, 100)
-        ax.axvline(x=50, color="grey", linestyle="--", alpha=0.5)
-        ax.set_title(title, fontsize=10, fontweight="bold", color="#1a1a2e")
-        ax.set_xlabel("Score", fontsize=8)
-        plt.tight_layout()
-        
-        safe_title = re.sub(r'[^a-zA-Z0-9_\-]', '_', title)[:30]
-        path = os.path.join(REPORTS_DIR, f"factors_{safe_title}.png")
-        fig.savefig(path, dpi=150, bbox_inches="tight")
-        plt.close(fig)
-        return path
-    except Exception as e:
-        logger.warning(f"Factor chart generation failed: {e}")
-        return None
+def _display_name(row: pd.Series, fallback: str) -> str:
+    value = row.get("name")
+    return str(value) if pd.notna(value) and str(value).strip() else ticker_to_name(fallback)
 
 
-def create_cumulative_returns_chart(
-    returns_dict: Dict[str, pd.Series],
-    title: str = "Strategy Cumulative Returns",
-    figsize: Tuple = (6, 3)
-) -> Optional[str]:
-    """
-    Create a multi-line cumulative returns chart.
-    
-    Args:
-        returns_dict: Dict mapping series name → cumulative returns Series
-        title: Chart title
-        figsize: Figure dimensions
-    
-    Returns:
-        Path to saved PNG
-    """
-    try:
-        fig, ax = plt.subplots(figsize=figsize)
-        line_colors = ["#0f3460", "#27ae60", "#e74c3c", "#f39c12"]
-        
-        for i, (name, series) in enumerate(returns_dict.items()):
-            if len(series) > 0:
-                ax.plot(series.index, series.values * 100,
-                        label=name, linewidth=1.5,
-                        color=line_colors[i % len(line_colors)])
-        
-        ax.set_title(title, fontsize=10, fontweight="bold", color="#1a1a2e")
-        ax.set_ylabel("Return (%)", fontsize=8)
-        ax.legend(fontsize=8, loc="upper left")
-        ax.grid(True, alpha=0.3, linestyle="--")
-        ax.axhline(y=0, color="black", linewidth=0.5)
-        ax.xaxis.set_major_formatter(mdates.DateFormatter("%b %y"))
-        plt.xticks(fontsize=8, rotation=45)
-        plt.yticks(fontsize=8)
-        plt.tight_layout()
-        
-        path = os.path.join(REPORTS_DIR, "cumulative_returns.png")
-        fig.savefig(path, dpi=150, bbox_inches="tight")
-        plt.close(fig)
-        return path
-    except Exception as e:
-        logger.warning(f"Returns chart generation failed: {e}")
-        return None
+def _fmt_pct(value: object, decimals: int = 1) -> str:
+    if value is None or pd.isna(value):
+        return "N/A"
+    return f"{float(value) * 100:.{decimals}f}%"
 
 
-# ============================================================================
-# TABLE BUILDERS
-# ============================================================================
-
-def build_metrics_table(
-    data: Dict[str, str],
-    col_widths: List[float] = None
-) -> Table:
-    """
-    Build a formatted two-column metrics table (label → value).
-    
-    Args:
-        data: Dict mapping metric label → formatted value
-        col_widths: Column widths in points
-    
-    Returns:
-        ReportLab Table object
-    """
-    if col_widths is None:
-        col_widths = [140, 100]
-    
-    table_data = [[k, v] for k, v in data.items()]
-    t = Table(table_data, colWidths=col_widths)
-    t.setStyle(TableStyle([
-        ("FONTNAME", (0, 0), (0, -1), "Helvetica"),
-        ("FONTNAME", (1, 0), (1, -1), "Helvetica-Bold"),
-        ("FONTSIZE", (0, 0), (-1, -1), 9),
-        ("TEXTCOLOR", (0, 0), (0, -1), colors.grey),
-        ("TEXTCOLOR", (1, 0), (1, -1), NAVY),
-        ("ALIGN", (1, 0), (1, -1), "RIGHT"),
-        ("BOTTOMPADDING", (0, 0), (-1, -1), 4),
-        ("TOPPADDING", (0, 0), (-1, -1), 4),
-        ("LINEBELOW", (0, 0), (-1, -2), 0.5, MID_GREY),
-    ]))
-    return t
+def _fmt_score(value: object) -> str:
+    if value is None or pd.isna(value):
+        return "N/A"
+    return f"{float(value):.1f}"
 
 
-def build_stock_table(
-    df: pd.DataFrame,
-    columns: List[str],
-    headers: List[str] = None,
-    col_widths: List[float] = None
-) -> Table:
-    """
-    Build a multi-column stock data table.
-    
-    Args:
-        df: DataFrame with stock data
-        columns: Column names to include
-        headers: Display headers (defaults to column names)
-        col_widths: Column widths
-    
-    Returns:
-        ReportLab Table object
-    """
-    if headers is None:
-        headers = columns
-    
-    available = [c for c in columns if c in df.columns]
-    if not available:
-        return Table([["No data available"]])
-    
-    table_data = [headers[:len(available)]]
-    
-    # Explicit mapping to prevent silent ratio misidentification
-    ratio_cols = ["composite_score", "value_score", "quality_score", "momentum_score"]
-    
-    for idx, row in df.head(15).iterrows():
-        row_data = []
-        for col in available:
-            val = row.get(col, "N/A")
-            if pd.isna(val):
-                row_data.append("N/A")
-            elif isinstance(val, float):
-                if col in ratio_cols:
-                    row_data.append(f"{val:.1f}")
-                elif abs(val) < 1:
-                    row_data.append(f"{val:.2%}")
-                elif abs(val) > 1e6:
-                    row_data.append(fmt_large_number(val))
-                else:
-                    row_data.append(f"{val:.1f}")
-            else:
-                row_data.append(str(val)[:25])
-        table_data.append(row_data)
-    
-    if col_widths is None:
-        col_widths = [max(80, 480 / len(available))] * len(available)
-    
-    t = Table(table_data, colWidths=col_widths[:len(available)])
-    t.setStyle(TableStyle([
-        # Header row
-        ("BACKGROUND", (0, 0), (-1, 0), NAVY),
-        ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
-        ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
-        ("FONTSIZE", (0, 0), (-1, 0), 8),
-        ("ALIGN", (0, 0), (-1, 0), "CENTER"),
-        # Data rows
-        ("FONTNAME", (0, 1), (-1, -1), "Helvetica"),
-        ("FONTSIZE", (0, 1), (-1, -1), 8),
-        ("ALIGN", (1, 1), (-1, -1), "RIGHT"),
-        ("ALIGN", (0, 1), (0, -1), "LEFT"),
-        # Alternating row colors
-        ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.white, LIGHT_GREY]),
-        # Borders
-        ("LINEBELOW", (0, 0), (-1, 0), 1, ACCENT_TEAL),
-        ("LINEBELOW", (0, -1), (-1, -1), 0.5, MID_GREY),
-        ("BOTTOMPADDING", (0, 0), (-1, -1), 4),
-        ("TOPPADDING", (0, 0), (-1, -1), 4),
-    ]))
-    return t
+def _fmt_multiple(value: object) -> str:
+    if value is None or pd.isna(value):
+        return "N/A"
+    return f"{float(value):.1f}x"
 
 
-# ============================================================================
-# REPORT SECTIONS
-# ============================================================================
-
-def build_cover_page(styles: Dict) -> List:
-    """Build the cover page elements."""
-    elements = []
-    elements.append(Spacer(1, 80))
-    elements.append(Paragraph(REPORT_TITLE, styles["CoverTitle"]))
-    elements.append(Paragraph(REPORT_SUBTITLE, styles["CoverSubtitle"]))
-    elements.append(Spacer(1, 10))
-    
-    # Horizontal rule
-    elements.append(HRFlowable(
-        width="60%", thickness=2, color=ACCENT_TEAL,
-        spaceBefore=10, spaceAfter=20
-    ))
-    
-    date_str = datetime.now().strftime("%B %d, %Y")
-    elements.append(Paragraph(f"Generated: {date_str}", styles["CoverDate"]))
-    elements.append(Paragraph("Systematic Factor-Based Analysis", styles["CoverDate"]))
-    elements.append(Spacer(1, 40))
-    elements.append(Paragraph(
-        "This report presents a systematic long/short equity strategy "
-        "applied to Indian equities. Stocks are scored using a multi-factor "
-        "model combining Value, Quality, and Momentum signals, with the short "
-        "book restricted to F&O-eligible names.",
-        styles["BodyText"]
-    ))
-    elements.append(Spacer(1, 200))
-    elements.append(Paragraph(
-        "CONFIDENTIAL — For Institutional Use Only",
-        styles["Disclaimer"]
-    ))
-    elements.append(PageBreak())
-    return elements
+def _fmt_plain_number(value: object, decimals: int = 1) -> str:
+    if value is None or pd.isna(value):
+        return "N/A"
+    return f"{float(value):,.{decimals}f}"
 
 
-def build_market_overview(
-    styles: Dict,
-    index_data: Dict[str, pd.DataFrame],
-    scored_universe: pd.DataFrame
-) -> List:
-    """Build the Market Overview section."""
-    elements = []
-    elements.append(Paragraph("1. Market Overview", styles["SectionTitle"]))
-    elements.append(HRFlowable(width="100%", thickness=1, color=ACCENT_TEAL, spaceAfter=10))
-    
-    # Index performance table
-    perf_data = {}
-    for name, df in index_data.items():
-        if len(df) > 0 and "Close" in df.columns:
-            prices = df["Close"]
-            ytd_ret = prices.iloc[-1] / prices.iloc[0] - 1
-            perf_data[name] = fmt_pct(ytd_ret)
-    
-    if perf_data:
-        elements.append(Paragraph("Index Performance (YTD)", styles["SubsectionTitle"]))
-        elements.append(build_metrics_table(perf_data))
-        elements.append(Spacer(1, 15))
-    
-    # Universe statistics
-    if not scored_universe.empty:
-        universe_stats = {
-            "Total Stocks": str(len(scored_universe)),
-            "Avg Composite Score": fmt_number(scored_universe["composite_score"].mean())
-                if "composite_score" in scored_universe.columns else "N/A",
-            "Median P/E": fmt_ratio(scored_universe["pe_ratio"].median())
-                if "pe_ratio" in scored_universe.columns else "N/A",
-            "Median EV/EBITDA": fmt_ratio(scored_universe["ev_ebitda"].median())
-                if "ev_ebitda" in scored_universe.columns else "N/A",
-            "Avg Volatility": fmt_pct(scored_universe["volatility"].mean())
-                if "volatility" in scored_universe.columns else "N/A",
-        }
-        elements.append(Paragraph("Universe Statistics", styles["SubsectionTitle"]))
-        elements.append(build_metrics_table(universe_stats))
-    
-    # Index price charts
-    for name, df in list(index_data.items())[:3]:
-        if "Close" in df.columns:
-            chart_path = create_price_chart(df["Close"], title=name)
-            if chart_path and os.path.exists(chart_path):
-                elements.append(Spacer(1, 10))
-                elements.append(Image(chart_path, width=420, height=175))
-    
-    elements.append(PageBreak())
-    return elements
-
-
-def build_stock_idea_section(
-    styles: Dict,
-    stock_row: pd.Series,
-    ticker: str,
-    price_data: Dict[str, pd.DataFrame],
-    position_type: str = "LONG"
-) -> List:
-    """
-    Build a single stock idea section with thesis, financials, and chart.
-    
-    Args:
-        styles: Report paragraph styles
-        stock_row: Series with stock metrics
-        ticker: Ticker symbol
-        price_data: Price data for chart generation
-        position_type: "LONG" or "SHORT"
-    """
-    elements = []
-    
-    # Stock header
-    name = stock_row.get("name", ticker_to_name(ticker))
-    score = stock_row.get("composite_score", 0)
-    color_hex = "#27ae60" if position_type == "LONG" else "#e74c3c"
-    
-    elements.append(Paragraph(
-        f'<font color="{color_hex}">{position_type}</font> — '
-        f'{name} ({ticker}) — Score: {score:.1f}',
-        styles["StockTitle"]
-    ))
-    
-    # Investment Thesis
-    elements.append(Paragraph("Investment Thesis", styles["SubsectionTitle"]))
-    
-    # Auto-generate thesis from metrics
-    thesis_points = []
-    if position_type == "LONG":
-        if stock_row.get("value_score", 50) > 60:
-            thesis_points.append("• Attractively valued relative to sector peers")
-        if stock_row.get("quality_score", 50) > 60:
-            thesis_points.append("• Strong quality metrics with solid profitability")
-        if stock_row.get("momentum_score", 50) > 60:
-            thesis_points.append("• Positive price momentum supporting the setup")
-        if stock_row.get("revenue_growth_yoy") and stock_row["revenue_growth_yoy"] > 0:
-            thesis_points.append(f"• Revenue growing {fmt_pct(stock_row['revenue_growth_yoy'])} YoY")
+def _safe_cell(value: object) -> str:
+    if value is None or pd.isna(value):
+        text = "N/A"
     else:
-        if stock_row.get("value_score", 50) < 40:
-            thesis_points.append("• Expensive valuation relative to peers")
-        if stock_row.get("quality_score", 50) < 40:
-            thesis_points.append("• Weak quality metrics and declining profitability")
-        if stock_row.get("momentum_score", 50) < 40:
-            thesis_points.append("• Negative price momentum confirming weakness")
-        if stock_row.get("leverage") and stock_row["leverage"] > 3:
-            thesis_points.append(f"• High leverage at {fmt_ratio(stock_row['leverage'])}")
-    
-    if not thesis_points:
-        thesis_points.append("• Systematic factor model identifies this stock based on composite scoring")
-    
-    for point in thesis_points:
-        elements.append(Paragraph(point, styles["BulletText"]))
-    
-    elements.append(Spacer(1, 8))
-    
-    # Key Financials Table
-    financials = {}
-    metric_map = {
-        "Market Cap": ("market_cap", fmt_large_number),
-        "P/E Ratio": ("pe_ratio", lambda x: fmt_ratio(x)),
-        "EV/EBITDA": ("ev_ebitda", lambda x: fmt_ratio(x)),
-        "FCF Yield": ("fcf_yield", lambda x: fmt_pct(x)),
-        "EBITDA Margin": ("ebitda_margin", lambda x: fmt_pct(x)),
-        "Net Margin": ("net_margin", lambda x: fmt_pct(x)),
-        "Revenue Growth": ("revenue_growth_yoy", lambda x: fmt_pct(x)),
-        "ROIC": ("roic", lambda x: fmt_pct(x)),
-        "Leverage (ND/EBITDA)": ("leverage", lambda x: fmt_ratio(x)),
-        "Volatility": ("volatility", lambda x: fmt_pct(x)),
-        "3M Return": ("mom_3m", lambda x: fmt_pct(x)),
-        "6M Return": ("mom_6m", lambda x: fmt_pct(x)),
-    }
-    
-    for label, (col, formatter) in metric_map.items():
-        val = stock_row.get(col)
-        if val is not None and not pd.isna(val):
-            financials[label] = formatter(val)
-    
-    if financials:
-        elements.append(Paragraph("Key Financials & Valuation", styles["SubsectionTitle"]))
-        elements.append(build_metrics_table(financials))
-    
-    # Factor breakdown chart
-    factor_scores = {}
-    for label, col in [
-        ("Value", "value_score"), ("Quality", "quality_score"),
-        ("Momentum", "momentum_score")
+        text = str(value)
+    return text.replace("|", "&#124;").replace("\n", "<br>")
+
+
+def _markdown_table(headers: List[str], rows: List[List[object]]) -> str:
+    lines = [
+        "| " + " | ".join(headers) + " |",
+        "| " + " | ".join(["---"] * len(headers)) + " |",
+    ]
+    for row in rows:
+        lines.append("| " + " | ".join(_safe_cell(value) for value in row) + " |")
+    return "\n".join(lines)
+
+
+def _data_as_of(price_data: Dict[str, pd.DataFrame], index_data: Dict[str, pd.DataFrame]) -> str:
+    dates = []
+    for frame in list(price_data.values()) + list(index_data.values()):
+        if frame is not None and not frame.empty and len(frame.index) > 0:
+            dates.append(pd.to_datetime(frame.index[-1]).date())
+    return max(dates).isoformat() if dates else datetime.now().date().isoformat()
+
+
+def _ytd_return(frame: pd.DataFrame) -> Optional[float]:
+    if frame is None or frame.empty or "Close" not in frame.columns:
+        return None
+    closes = frame["Close"].dropna()
+    if closes.empty:
+        return None
+    current_year = closes.index[-1].year
+    this_year = closes[closes.index.year == current_year]
+    base = this_year.iloc[0] if not this_year.empty else closes.iloc[0]
+    if base == 0:
+        return None
+    return closes.iloc[-1] / base - 1
+
+
+def _compute_sector_snapshot(scored_universe: pd.DataFrame) -> pd.DataFrame:
+    if scored_universe.empty or "sector" not in scored_universe.columns:
+        return pd.DataFrame()
+    grouped = (
+        scored_universe.groupby("sector", dropna=False)
+        .agg(
+            stocks=("sector", "size"),
+            avg_3m_return=("mom_3m", "mean"),
+            avg_6m_return=("mom_6m", "mean"),
+            median_score=("composite_score", "median"),
+            median_pe=("pe_ratio", "median"),
+        )
+        .reset_index()
+        .sort_values(["avg_3m_return", "median_score"], ascending=[False, False])
+    )
+    return grouped
+
+
+def _universe_statistics(scored_universe: pd.DataFrame) -> List[List[str]]:
+    fo_count = int(scored_universe["is_fo_eligible"].fillna(False).sum()) if "is_fo_eligible" in scored_universe.columns else 0
+    return [
+        ["Stocks in scored universe", str(len(scored_universe))],
+        ["F&O-eligible stocks", str(fo_count)],
+        ["Median P/E", _fmt_multiple(scored_universe["pe_ratio"].median()) if "pe_ratio" in scored_universe.columns else "N/A"],
+        ["Median EV/EBITDA", _fmt_multiple(scored_universe["ev_ebitda"].median()) if "ev_ebitda" in scored_universe.columns else "N/A"],
+        ["Average volatility", _fmt_pct(scored_universe["volatility"].mean()) if "volatility" in scored_universe.columns else "N/A"],
+        ["Median ROIC", _fmt_pct(scored_universe["roic"].median()) if "roic" in scored_universe.columns else "N/A"],
+        ["Median 3M return", _fmt_pct(scored_universe["mom_3m"].median()) if "mom_3m" in scored_universe.columns else "N/A"],
+        ["Median 6M return", _fmt_pct(scored_universe["mom_6m"].median()) if "mom_6m" in scored_universe.columns else "N/A"],
+    ]
+
+
+def _score_medians(scored_universe: pd.DataFrame) -> Dict[str, float]:
+    medians = {}
+    for column in [
+        "pe_ratio",
+        "ev_ebitda",
+        "ebitda_margin",
+        "net_margin",
+        "revenue_growth_yoy",
+        "roic",
+        "leverage",
+        "volatility",
+        "mom_3m",
+        "mom_6m",
     ]:
-        val = stock_row.get(col)
-        if val is not None and not pd.isna(val):
-            factor_scores[label] = float(val)
-    
-    if factor_scores:
-        chart_path = create_factor_breakdown_chart(factor_scores, title=f"{name} Factors")
-        if chart_path and os.path.exists(chart_path):
-            elements.append(Spacer(1, 5))
-            elements.append(Image(chart_path, width=280, height=180))
-    
-    # Price chart
-    if ticker in price_data:
-        prices = price_data[ticker]["Close"]
-        chart_path = create_price_chart(prices, title=f"{name} Price")
-        if chart_path and os.path.exists(chart_path):
-            elements.append(Spacer(1, 5))
-            elements.append(Image(chart_path, width=420, height=175))
-    
-    # Catalyst & Risks
-    elements.append(Paragraph("Catalyst", styles["SubsectionTitle"]))
-    if position_type == "LONG":
-        elements.append(Paragraph(
-            "• Factor convergence: improving quality metrics and positive momentum "
-            "suggest potential for mean-reversion in valuation multiple.",
-            styles["BulletText"]
-        ))
+        medians[column] = pd.to_numeric(scored_universe.get(column), errors="coerce").median() if column in scored_universe.columns else None
+    return medians
+
+
+def _metric_rows(row: pd.Series) -> List[List[str]]:
+    return [
+        ["Market Cap", fmt_large_number(row.get("market_cap"))],
+        ["P/E", _fmt_multiple(row.get("pe_ratio"))],
+        ["EV/EBITDA", _fmt_multiple(row.get("ev_ebitda"))],
+        ["EBITDA margin", _fmt_pct(row.get("ebitda_margin"))],
+        ["Net margin", _fmt_pct(row.get("net_margin"))],
+        ["Revenue Growth (YoY)", _fmt_pct(row.get("revenue_growth_yoy"))],
+        ["ROIC", _fmt_pct(row.get("roic"))],
+        ["Leverage (ND/EBITDA)", _fmt_multiple(row.get("leverage"))],
+        ["Volatility", _fmt_pct(row.get("volatility"))],
+        ["3M return", _fmt_pct(row.get("mom_3m"))],
+        ["6M return", _fmt_pct(row.get("mom_6m"))],
+    ]
+
+
+def _driver_label(long_row: pd.Series, short_row: pd.Series) -> str:
+    drivers = {
+        "Value": _coerce_float(long_row.get("value_score")) - _coerce_float(short_row.get("value_score")),
+        "Quality": _coerce_float(long_row.get("quality_score")) - _coerce_float(short_row.get("quality_score")),
+        "Momentum": _coerce_float(long_row.get("momentum_score")) - _coerce_float(short_row.get("momentum_score")),
+    }
+    return max(drivers, key=lambda key: abs(drivers[key]))
+
+
+def _long_strength_text(row: pd.Series) -> str:
+    strengths = {
+        "value": _coerce_float(row.get("value_score")),
+        "quality": _coerce_float(row.get("quality_score")),
+        "momentum": _coerce_float(row.get("momentum_score")),
+    }
+    dominant = max(strengths, key=strengths.get)
+    if dominant == "value":
+        return (
+            f"Valuation does most of the heavy lifting here: P/E at {_fmt_multiple(row.get('pe_ratio'))} "
+            f"and EV/EBITDA at {_fmt_multiple(row.get('ev_ebitda'))} keep the stock competitive even before "
+            "leaning on a rerating argument."
+        )
+    if dominant == "quality":
+        return (
+            f"Quality is the standout driver with EBITDA margin at {_fmt_pct(row.get('ebitda_margin'))}, "
+            f"net margin at {_fmt_pct(row.get('net_margin'))}, and ROIC at {_fmt_pct(row.get('roic'))}, "
+            "which points to stronger operating discipline than most peers."
+        )
+    return (
+        f"Momentum is already confirming the setup, with 3-month and 6-month returns of "
+        f"{_fmt_pct(row.get('mom_3m'))} and {_fmt_pct(row.get('mom_6m'))}. That improves the odds that "
+        "incremental flows keep chasing the winner."
+    )
+
+
+def _short_weakness_text(row: pd.Series) -> str:
+    weaknesses = {
+        "value": _coerce_float(100 - _coerce_float(row.get("value_score"))),
+        "quality": _coerce_float(100 - _coerce_float(row.get("quality_score"))),
+        "momentum": _coerce_float(100 - _coerce_float(row.get("momentum_score"))),
+    }
+    dominant = max(weaknesses, key=weaknesses.get)
+    if dominant == "value":
+        return (
+            f"The valuation cushion is thin: P/E at {_fmt_multiple(row.get('pe_ratio'))} and EV/EBITDA at "
+            f"{_fmt_multiple(row.get('ev_ebitda'))} still look demanding for a stock with a weak overall score."
+        )
+    if dominant == "quality":
+        return (
+            f"Operating quality is the core problem. EBITDA margin is {_fmt_pct(row.get('ebitda_margin'))}, "
+            f"net margin is {_fmt_pct(row.get('net_margin'))}, and ROIC is {_fmt_pct(row.get('roic'))}, "
+            "which leaves little margin for execution mistakes."
+        )
+    return (
+        f"Price action is already weak with 3-month and 6-month returns of {_fmt_pct(row.get('mom_3m'))} "
+        f"and {_fmt_pct(row.get('mom_6m'))}. That keeps the stock exposed if risk appetite stays selective."
+    )
+
+
+def _build_long_thesis(row: pd.Series, medians: Dict[str, float]) -> List[str]:
+    name = _display_name(row, str(row.name))
+    sector = row.get("sector", "its sector")
+    thesis = [
+        (
+            f"{name} is one of the cleaner longs in {sector} because it pairs a composite score of "
+            f"{_fmt_score(row.get('composite_score'))}/100 with valuation at P/E {_fmt_multiple(row.get('pe_ratio'))} "
+            f"and EV/EBITDA {_fmt_multiple(row.get('ev_ebitda'))}, versus universe medians of "
+            f"{_fmt_multiple(medians.get('pe_ratio'))} and {_fmt_multiple(medians.get('ev_ebitda'))}."
+        ),
+        _long_strength_text(row),
+        (
+            f"Balance-sheet risk is contained with leverage at {_fmt_multiple(row.get('leverage'))}, while "
+            f"revenue growth of {_fmt_pct(row.get('revenue_growth_yoy'))} gives the market a fundamental reason "
+            "to keep rewarding the factor signal."
+        ),
+    ]
+    return thesis
+
+
+def _build_short_thesis(row: pd.Series, medians: Dict[str, float]) -> List[str]:
+    name = _display_name(row, str(row.name))
+    sector = row.get("sector", "its sector")
+    thesis = [
+        (
+            f"{name} falls into the short book with a composite score of {_fmt_score(row.get('composite_score'))}/100, "
+            f"which is weak inside {sector} and sits well below the quality of names making the long side."
+        ),
+        _short_weakness_text(row),
+        (
+            f"Compared with universe medians of {_fmt_multiple(medians.get('pe_ratio'))} P/E and "
+            f"{_fmt_multiple(medians.get('ev_ebitda'))} EV/EBITDA, the stock does not offer enough valuation support "
+            "to offset soft fundamentals or poor tape action."
+        ),
+    ]
+    return thesis
+
+
+def _build_catalysts(row: pd.Series, side: str) -> List[str]:
+    sector = row.get("sector", "sector")
+    catalysts = []
+
+    revenue_growth = row.get("revenue_growth_yoy")
+    if pd.notna(revenue_growth):
+        if side == "LONG":
+            catalysts.append(
+                f"The next earnings print can validate current revenue growth of {_fmt_pct(revenue_growth)} and reinforce the market's confidence in the {sector} earnings path."
+            )
+        else:
+            catalysts.append(
+                f"The next earnings print is a risk event: if revenue growth stays around {_fmt_pct(revenue_growth)} or slips further, the market could keep cutting expectations for this {sector} name."
+            )
+
+    sentiment_count = row.get("sentiment_count", 0)
+    sentiment_score = row.get("sentiment_score")
+    if pd.notna(sentiment_score) and sentiment_count and float(sentiment_count) > 0:
+        if side == "LONG":
+            catalysts.append(
+                f"News flow is supportive with sentiment at {_fmt_plain_number(sentiment_score, 2)} across {int(sentiment_count)} recent items, which can help extend the rerating."
+            )
+        else:
+            catalysts.append(
+                f"News flow is only mildly supportive at {_fmt_plain_number(sentiment_score, 2)} across {int(sentiment_count)} items; any deterioration would quickly reinforce the short case."
+            )
+    elif pd.notna(row.get("mom_6m")):
+        if side == "LONG":
+            catalysts.append(
+                f"Six-month price strength of {_fmt_pct(row.get('mom_6m'))} can keep drawing incremental flows if sector leadership remains intact."
+            )
+        else:
+            catalysts.append(
+                f"The weak six-month tape of {_fmt_pct(row.get('mom_6m'))} can extend if investors continue rotating away from lower-ranked cyclicals and balance-sheet stories."
+            )
+
+    return catalysts[:2]
+
+
+def _build_risks(row: pd.Series, side: str, medians: Dict[str, float]) -> List[str]:
+    risks = []
+    if side == "LONG":
+        risks.append(
+            f"Volatility at {_fmt_pct(row.get('volatility'))} means even a high-ranked long can mean-revert sharply in a market-wide risk-off move."
+        )
+        risks.append(
+            f"If margins or ROIC soften from current levels of {_fmt_pct(row.get('ebitda_margin'))} and {_fmt_pct(row.get('roic'))}, the premium embedded in the factor score could compress quickly."
+        )
+        if pd.notna(row.get("pe_ratio")) and pd.notna(medians.get("pe_ratio")) and row.get("pe_ratio") > medians.get("pe_ratio"):
+            risks.append(
+                "This is not a deep-value long, so a miss on earnings or guidance can still trigger valuation de-rating."
+            )
     else:
-        elements.append(Paragraph(
-            "• Deteriorating fundamentals: declining margins and negative momentum "
-            "suggest further downside risk to current valuation.",
-            styles["BulletText"]
-        ))
-    
-    elements.append(Paragraph("Risks", styles["SubsectionTitle"]))
-    vol = stock_row.get("volatility")
-    vol_str = fmt_pct(vol) if vol and not pd.isna(vol) else "N/A"
-    elements.append(Paragraph(
-        f"• Annualised volatility: {vol_str}",
-        styles["BulletText"]
-    ))
-    dd = stock_row.get("max_drawdown")
-    dd_str = fmt_pct(dd) if dd and not pd.isna(dd) else "N/A"
-    elements.append(Paragraph(
-        f"• Maximum drawdown: {dd_str}",
-        styles["BulletText"]
-    ))
-    
-    elements.append(Spacer(1, 15))
-    elements.append(HRFlowable(width="80%", thickness=0.5, color=MID_GREY, spaceAfter=10))
-    
-    return elements
+        risks.append(
+            f"A positive surprise on margins or growth would matter because the stock is already carrying weak expectations at EBITDA margin {_fmt_pct(row.get('ebitda_margin'))} and revenue growth {_fmt_pct(row.get('revenue_growth_yoy'))}."
+        )
+        risks.append(
+            f"Volatility of {_fmt_pct(row.get('volatility'))} leaves room for sharp countertrend rallies that can hurt short timing even when the broader thesis stays intact."
+        )
+        if pd.notna(row.get("sentiment_score")) and row.get("sentiment_score", 0) > 0.1:
+            risks.append(
+                f"Sentiment is not outright bearish at {_fmt_plain_number(row.get('sentiment_score'), 2)}, so the short can squeeze if the market latches onto incremental good news."
+            )
+    return risks[:3]
 
 
-def build_relative_trades_section(
-    styles: Dict,
-    pairs: List[Dict]
-) -> List:
-    """Build the Relative Trades section."""
-    elements = []
-    elements.append(Paragraph("4. Relative Trades", styles["SectionTitle"]))
-    elements.append(HRFlowable(width="100%", thickness=1, color=ACCENT_TEAL, spaceAfter=10))
-    
-    elements.append(Paragraph(
-        "The following pair trade ideas match stocks with the highest spread "
-        "in composite factor scores, preferring sector-matched pairs for "
-        "reduced systematic risk.",
-        styles["BodyText"]
-    ))
-    elements.append(Spacer(1, 10))
-    
-    if pairs:
-        # Build pairs table
-        table_data = [["#", "Long", "Short", "Sector", "Score Spread"]]
-        for i, pair in enumerate(pairs, 1):
-            table_data.append([
-                str(i),
-                f"{pair['long_name']}",
-                f"{pair['short_name']}",
-                pair.get("sector", "Cross-Sector")[:20],
-                f"{pair['score_spread']:.1f}",
-            ])
-        
-        t = Table(table_data, colWidths=[30, 120, 120, 110, 80])
-        t.setStyle(TableStyle([
+def _top_names(book: pd.DataFrame, count: int) -> str:
+    if book is None or book.empty:
+        return ""
+    names = []
+    for ticker, row in book.head(count).iterrows():
+        names.append(_display_name(row, ticker))
+    return ", ".join(names)
+
+
+def _executive_summary_paragraphs(
+    scored_universe: pd.DataFrame,
+    long_book: pd.DataFrame,
+    short_book: pd.DataFrame,
+    index_data: Dict[str, pd.DataFrame],
+) -> List[str]:
+    index_returns = []
+    for name, frame in index_data.items():
+        value = _ytd_return(frame)
+        if value is not None:
+            index_returns.append(f"{name} {_fmt_pct(value)}")
+    index_context = ", ".join(index_returns) if index_returns else "index performance unavailable"
+
+    avg_vol = _fmt_pct(scored_universe["volatility"].mean()) if "volatility" in scored_universe.columns and not scored_universe.empty else "N/A"
+    median_pe = _fmt_multiple(scored_universe["pe_ratio"].median()) if "pe_ratio" in scored_universe.columns and not scored_universe.empty else "N/A"
+    median_ev = _fmt_multiple(scored_universe["ev_ebitda"].median()) if "ev_ebitda" in scored_universe.columns and not scored_universe.empty else "N/A"
+    top_longs = _top_names(long_book, TOP_N_LONG)
+    top_shorts = _top_names(short_book, TOP_N_SHORT)
+
+    return [
+        (
+            f"Indian equities are trading through a mixed but still investable backdrop, with {index_context}. "
+            f"Across the screened universe, average volatility is {avg_vol}, median P/E is {median_pe}, and median EV/EBITDA is {median_ev}, which points to a market that is not broadly cheap but still offers meaningful stock-level dispersion."
+        ),
+        (
+            f"The long book is led by {top_longs or 'the highest-ranked names'}, where valuation, operating quality, and momentum are reinforcing each other. "
+            f"The short book is led by {top_shorts or 'the weakest-ranked names'}, where lower-quality fundamentals and softer price action are leaving certain F&O-eligible stocks exposed."
+        ),
+        (
+            "The practical takeaway is that the opportunity set supports both outright longs and cleaner relative-value trades inside the same sectors. "
+            "The report below focuses on names where factor alignment is strongest rather than offering a generic market recap."
+        ),
+    ]
+
+
+def _index_rows(index_data: Dict[str, pd.DataFrame]) -> List[List[str]]:
+    rows = []
+    for name, frame in index_data.items():
+        latest = frame["Close"].iloc[-1] if frame is not None and not frame.empty and "Close" in frame.columns else None
+        rows.append([name, _fmt_pct(_ytd_return(frame)), _fmt_plain_number(latest, 0)])
+    return rows or [["N/A", "N/A", "N/A"]]
+
+
+def _sector_rows(scored_universe: pd.DataFrame) -> List[List[str]]:
+    snapshot = _compute_sector_snapshot(scored_universe)
+    rows = []
+    if not snapshot.empty:
+        for _, row in snapshot.iterrows():
+            rows.append(
+                [
+                    row["sector"],
+                    str(int(row["stocks"])),
+                    _fmt_pct(row["avg_3m_return"]),
+                    _fmt_pct(row["avg_6m_return"]),
+                    _fmt_score(row["median_score"]),
+                    _fmt_multiple(row["median_pe"]),
+                ]
+            )
+    return rows or [["N/A", "0", "N/A", "N/A", "N/A", "N/A"]]
+
+
+def _appendix_rows(scored_universe: pd.DataFrame) -> List[List[str]]:
+    top20 = (
+        scored_universe.sort_values("composite_score", ascending=False).head(20)
+        if not scored_universe.empty and "composite_score" in scored_universe.columns
+        else pd.DataFrame()
+    )
+    rows = []
+    if not top20.empty:
+        for ticker, row in top20.iterrows():
+            rows.append(
+                [
+                    row.get("symbol", ticker),
+                    _display_name(row, ticker),
+                    row.get("sector", "Unknown"),
+                    _fmt_score(row.get("composite_score")),
+                    _fmt_score(row.get("value_score")),
+                    _fmt_score(row.get("quality_score")),
+                    _fmt_score(row.get("momentum_score")),
+                    _fmt_multiple(row.get("pe_ratio")),
+                    _fmt_multiple(row.get("ev_ebitda")),
+                    _fmt_pct(row.get("mom_3m")),
+                    _fmt_pct(row.get("mom_6m")),
+                ]
+            )
+    return rows or [["N/A"] * 11]
+
+
+def _relative_trade_payloads(
+    scored_universe: pd.DataFrame,
+    pairs: List[Dict],
+) -> List[Dict[str, str]]:
+    payloads = []
+    for pair in pairs[:5]:
+        long_ticker = pair.get("long_ticker")
+        short_ticker = pair.get("short_ticker")
+        if long_ticker not in scored_universe.index or short_ticker not in scored_universe.index:
+            continue
+        long_row = scored_universe.loc[long_ticker]
+        short_row = scored_universe.loc[short_ticker]
+        driver = _driver_label(long_row, short_row)
+        payloads.append(
+            {
+                "title": f"Long {pair['long_name']} / Short {pair['short_name']}",
+                "sector": pair.get("sector", "Cross-Sector"),
+                "ratio": "1:1",
+                "driver": driver,
+                "score_gap": (
+                    f"{pair['long_name']} scores {_fmt_score(long_row.get('composite_score'))} versus "
+                    f"{_fmt_score(short_row.get('composite_score'))} for {pair['short_name']}, with {driver.lower()} "
+                    "showing the widest separation."
+                ),
+                "quality_gap": (
+                    f"The long carries EBITDA margin {_fmt_pct(long_row.get('ebitda_margin'))} and ROIC "
+                    f"{_fmt_pct(long_row.get('roic'))} against {_fmt_pct(short_row.get('ebitda_margin'))} and "
+                    f"{_fmt_pct(short_row.get('roic'))} on the short."
+                ),
+                "momentum_gap": (
+                    f"On momentum, the long is at {_fmt_pct(long_row.get('mom_6m'))} over 6 months versus "
+                    f"{_fmt_pct(short_row.get('mom_6m'))} for the short, giving the spread a clear tape-confirmation angle."
+                ),
+                "chart": f"Chart: 12-month relative return spread of {pair['long_name']} minus {pair['short_name']}.",
+            }
+        )
+    return payloads
+
+
+def _stock_markdown_section(row: pd.Series, side: str, medians: Dict[str, float], index_name: str = "NIFTY 50") -> str:
+    name = _display_name(row, str(row.name))
+    symbol = row.get("symbol", row.name)
+    thesis = _build_long_thesis(row, medians) if side == "LONG" else _build_short_thesis(row, medians)
+    catalysts = _build_catalysts(row, side)
+    risks = _build_risks(row, side, medians)
+
+    lines = [
+        f"### {name} ({symbol})",
+        f"Chart: {name} price versus {index_name} over the last 6 months, with volume and factor-score callouts.",
+        "",
+        "**Investment Thesis**",
+    ]
+    lines.extend(f"- {item}" for item in thesis)
+    lines.extend(["", _markdown_table(["Metric", "Value"], _metric_rows(row)), "", "**Catalysts**"])
+    lines.extend(
+        f"- {item}" for item in (catalysts or ["Near-term earnings, sector rotation, and price confirmation will determine whether the current setup strengthens or fades."])
+    )
+    lines.extend(["", "**Risks**"])
+    lines.extend(f"- {item}" for item in risks)
+    lines.append("")
+    return "\n".join(lines)
+
+
+def _idea_markdown_section(title: str, book: pd.DataFrame, medians: Dict[str, float], side: str) -> str:
+    lines = [title, ""]
+    if book.empty:
+        lines.append("No qualifying ideas were available for this side of the book.")
+        lines.append("")
+        return "\n".join(lines)
+
+    limit = TOP_N_LONG if side == "LONG" else TOP_N_SHORT
+    for _, row in book.head(limit).iterrows():
+        lines.append(_stock_markdown_section(row, side, medians))
+    return "\n".join(lines)
+
+
+def _markdown_report_content(
+    scored_universe: pd.DataFrame,
+    long_book: pd.DataFrame,
+    short_book: pd.DataFrame,
+    price_data: Dict[str, pd.DataFrame],
+    index_data: Dict[str, pd.DataFrame],
+    pairs: List[Dict],
+) -> str:
+    as_of = _data_as_of(price_data, index_data)
+    medians = _score_medians(scored_universe)
+    executive = _executive_summary_paragraphs(scored_universe, long_book, short_book, index_data)
+    relative_payloads = _relative_trade_payloads(scored_universe, pairs)
+
+    sections = [
+        f"# Indian Equity Research Report\n\n**Data as of:** {as_of}\n",
+        "## 1. Executive Summary\n\n" + "\n\n".join(executive) + "\n",
+        "\n".join(
+            [
+                "## 2. Market Overview",
+                "Chart: YTD normalized performance of NIFTY 50, NIFTY Bank, and Sensex.",
+                "",
+                "### YTD Index Returns",
+                _markdown_table(["Index", "YTD Return", "Latest Level"], _index_rows(index_data)),
+                "",
+                "### Sector Performance Snapshot",
+                _markdown_table(
+                    ["Sector", "Stocks", "Avg 3M Return", "Avg 6M Return", "Median Composite", "Median P/E"],
+                    _sector_rows(scored_universe),
+                ),
+                "",
+                "### Universe Statistics",
+                _markdown_table(["Statistic", "Value"], _universe_statistics(scored_universe)),
+                "",
+            ]
+        ),
+        _idea_markdown_section("## 3. Top Long Ideas", long_book, medians, "LONG"),
+        _idea_markdown_section("## 4. Top Short Ideas", short_book, medians, "SHORT"),
+    ]
+
+    relative_lines = ["## 5. Relative Trades", ""]
+    if relative_payloads:
+        for payload in relative_payloads:
+            relative_lines.extend(
+                [
+                    f"### {payload['title']}",
+                    f"- Sector: {payload['sector']}",
+                    f"- Notional ratio: {payload['ratio']}",
+                    f"- Key spread driver: {payload['driver']}",
+                    f"- {payload['score_gap']}",
+                    f"- {payload['quality_gap']}",
+                    f"- {payload['momentum_gap']}",
+                    payload["chart"],
+                    "",
+                ]
+            )
+    else:
+        relative_lines.append("No sector-matched pair trades were available from the current books.")
+        relative_lines.append("")
+    sections.append("\n".join(relative_lines))
+
+    sections.append(
+        "\n".join(
+            [
+                "## 6. Appendix",
+                "### Top 20 Universe Ranking",
+                _markdown_table(
+                    ["Symbol", "Name", "Sector", "Composite", "Value", "Quality", "Momentum", "P/E", "EV/EBITDA", "3M", "6M"],
+                    _appendix_rows(scored_universe),
+                ),
+                "",
+                "### Factor Definitions",
+                "- Value: rewards cheaper valuation and higher free-cash-flow yield. Higher score means the stock looks cheaper on the current metrics set.",
+                "- Quality: rewards stronger margins, better ROIC, and lower leverage. Higher score means stronger operating quality and cleaner balance-sheet profile.",
+                "- Momentum: rewards stronger 3-month and 6-month price performance. Higher score means the market is already validating the story.",
+                "- Scoring range: each factor and the composite are normalized to a 0-100 scale. Around 50 is neutral, the long book is built from the top decile, and the short book is built from the bottom decile of F&O-eligible names.",
+                "",
+            ]
+        )
+    )
+    sections.append(
+        "## 7. Disclaimer\nThis report is for informational purposes only and reflects a systematic interpretation of market data, factor signals, and recent price action. It is not investment advice, not a solicitation to buy or sell securities, and should not be used as the sole basis for any investment decision. Market conditions can change quickly, data may be revised, and all investing involves risk, including the risk of capital loss.\n"
+    )
+
+    return "\n".join(section.strip() for section in sections if section).strip() + "\n"
+
+
+if REPORTLAB_AVAILABLE:
+    NAVY = colors.HexColor("#11253d")
+    BLUE = colors.HexColor("#1f4e79")
+    TEAL = colors.HexColor("#2e8b8b")
+    LIGHT_GREY = colors.HexColor("#f5f7fa")
+    MID_GREY = colors.HexColor("#d9dee7")
+    DARK_GREY = colors.HexColor("#55606e")
+
+
+    def _get_styles() -> Dict[str, ParagraphStyle]:
+        base = getSampleStyleSheet()
+        return {
+            "Title": ParagraphStyle(
+                "Title",
+                parent=base["Title"],
+                fontName="Helvetica-Bold",
+                fontSize=22,
+                leading=28,
+                textColor=NAVY,
+                spaceAfter=6,
+            ),
+            "Meta": ParagraphStyle(
+                "Meta",
+                parent=base["Normal"],
+                fontName="Helvetica",
+                fontSize=10,
+                leading=14,
+                textColor=DARK_GREY,
+                spaceAfter=4,
+            ),
+            "Section": ParagraphStyle(
+                "Section",
+                parent=base["Heading1"],
+                fontName="Helvetica-Bold",
+                fontSize=15,
+                leading=19,
+                textColor=NAVY,
+                spaceBefore=10,
+                spaceAfter=6,
+            ),
+            "Subsection": ParagraphStyle(
+                "Subsection",
+                parent=base["Heading2"],
+                fontName="Helvetica-Bold",
+                fontSize=11,
+                leading=14,
+                textColor=BLUE,
+                spaceBefore=8,
+                spaceAfter=4,
+            ),
+            "StockTitle": ParagraphStyle(
+                "StockTitle",
+                parent=base["Heading3"],
+                fontName="Helvetica-Bold",
+                fontSize=11,
+                leading=14,
+                textColor=NAVY,
+                spaceBefore=8,
+                spaceAfter=4,
+            ),
+            "Body": ParagraphStyle(
+                "Body",
+                parent=base["BodyText"],
+                fontName="Helvetica",
+                fontSize=9,
+                leading=13,
+                textColor=colors.black,
+                spaceAfter=5,
+            ),
+            "Bullet": ParagraphStyle(
+                "Bullet",
+                parent=base["BodyText"],
+                fontName="Helvetica",
+                fontSize=9,
+                leading=12,
+                leftIndent=10,
+                firstLineIndent=0,
+                textColor=colors.black,
+                spaceAfter=3,
+            ),
+            "Caption": ParagraphStyle(
+                "Caption",
+                parent=base["Italic"],
+                fontName="Helvetica-Oblique",
+                fontSize=8,
+                leading=11,
+                textColor=TEAL,
+                spaceAfter=5,
+            ),
+            "Disclaimer": ParagraphStyle(
+                "Disclaimer",
+                parent=base["BodyText"],
+                fontName="Helvetica-Oblique",
+                fontSize=7,
+                leading=10,
+                textColor=DARK_GREY,
+                spaceAfter=3,
+            ),
+            "TableHeader": ParagraphStyle(
+                "TableHeader",
+                parent=base["BodyText"],
+                fontName="Helvetica-Bold",
+                fontSize=8,
+                leading=10,
+                textColor=colors.white,
+            ),
+            "TableCell": ParagraphStyle(
+                "TableCell",
+                parent=base["BodyText"],
+                fontName="Helvetica",
+                fontSize=8,
+                leading=10,
+                textColor=colors.black,
+            ),
+            "TableCellSmall": ParagraphStyle(
+                "TableCellSmall",
+                parent=base["BodyText"],
+                fontName="Helvetica",
+                fontSize=7,
+                leading=9,
+                textColor=colors.black,
+            ),
+        }
+
+
+    def _escape_pdf(value: object) -> str:
+        return html.escape("N/A" if value is None or pd.isna(value) else str(value))
+
+
+    def _make_pdf_table(
+        headers: List[str],
+        rows: List[List[object]],
+        styles: Dict[str, ParagraphStyle],
+        col_widths: Optional[List[float]] = None,
+        small: bool = False,
+    ) -> Table:
+        cell_style = styles["TableCellSmall"] if small else styles["TableCell"]
+        data = [[Paragraph(_escape_pdf(header), styles["TableHeader"]) for header in headers]]
+        for row in rows:
+            data.append([Paragraph(_escape_pdf(value), cell_style) for value in row])
+
+        table = Table(data, colWidths=col_widths, repeatRows=1, hAlign="LEFT")
+        table_style = [
             ("BACKGROUND", (0, 0), (-1, 0), NAVY),
             ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
-            ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
-            ("FONTSIZE", (0, 0), (-1, -1), 9),
-            ("ALIGN", (0, 0), (-1, -1), "CENTER"),
-            ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.white, LIGHT_GREY]),
-            ("LINEBELOW", (0, 0), (-1, 0), 1, ACCENT_TEAL),
-            ("BOTTOMPADDING", (0, 0), (-1, -1), 5),
-            ("TOPPADDING", (0, 0), (-1, -1), 5),
-        ]))
-        elements.append(t)
-    else:
-        elements.append(Paragraph(
-            "No relative trade pairs identified in this period.",
-            styles["BodyText"]
-        ))
-    
-    elements.append(PageBreak())
-    return elements
+            ("GRID", (0, 0), (-1, -1), 0.35, MID_GREY),
+            ("VALIGN", (0, 0), (-1, -1), "TOP"),
+            ("LEFTPADDING", (0, 0), (-1, -1), 5),
+            ("RIGHTPADDING", (0, 0), (-1, -1), 5),
+            ("TOPPADDING", (0, 0), (-1, -1), 4),
+            ("BOTTOMPADDING", (0, 0), (-1, -1), 4),
+        ]
+        for idx in range(1, len(data)):
+            background = LIGHT_GREY if idx % 2 else colors.white
+            table_style.append(("BACKGROUND", (0, idx), (-1, idx), background))
+        table.setStyle(TableStyle(table_style))
+        return table
 
 
-def build_appendix(
-    styles: Dict,
-    scored_universe: pd.DataFrame,
-    backtest_results: Dict = None
-) -> List:
-    """Build the Appendix section with data tables and backtest results."""
-    elements = []
-    elements.append(Paragraph("5. Appendix", styles["SectionTitle"]))
-    elements.append(HRFlowable(width="100%", thickness=1, color=ACCENT_TEAL, spaceAfter=10))
-    
-    # Full universe scoring table
-    elements.append(Paragraph("A. Full Universe Scores (Top 20)", styles["SubsectionTitle"]))
-    
-    if not scored_universe.empty:
-        cols_to_show = ["name", "composite_score", "value_score", "quality_score", "momentum_score"]
-        available = [c for c in cols_to_show if c in scored_universe.columns]
-        if available:
-            top20 = scored_universe.sort_values("composite_score", ascending=False).head(20)
-            headers = ["Name", "Composite", "Value", "Quality", "Momentum"][:len(available)]
-            elements.append(build_stock_table(top20, available, headers))
-    
-    elements.append(Spacer(1, 20))
-    
-    # Backtest results
-    if backtest_results and "metrics" in backtest_results:
-        elements.append(Paragraph("B. Backtest Performance", styles["SubsectionTitle"]))
-        elements.append(build_metrics_table(backtest_results["metrics"]))
-        
-        # Cumulative returns chart
-        returns_series = {}
-        for key, label in [
-            ("cumulative_returns", "L/S Portfolio"),
-            ("long_cumulative", "Long Leg"),
-            ("short_cumulative", "Short Leg"),
-        ]:
-            if key in backtest_results and len(backtest_results[key]) > 0:
-                returns_series[label] = backtest_results[key]
-        
-        if returns_series:
-            chart_path = create_cumulative_returns_chart(returns_series)
-            if chart_path and os.path.exists(chart_path):
-                elements.append(Spacer(1, 10))
-                elements.append(Image(chart_path, width=420, height=210))
-    
-    # Disclaimer
-    elements.append(Spacer(1, 40))
-    elements.append(HRFlowable(width="100%", thickness=0.5, color=MID_GREY, spaceAfter=5))
-    elements.append(Paragraph(
-        "DISCLAIMER: This report is generated algorithmically and is for informational "
-        "purposes only. It does not constitute investment advice. Past performance is not "
-        "indicative of future results. All investments carry risk.",
-        styles["Disclaimer"]
-    ))
-    
-    return elements
+    def _append_bullets(story: List[object], items: List[str], styles: Dict[str, ParagraphStyle]) -> None:
+        for item in items:
+            story.append(Paragraph(f"&bull; {_escape_pdf(item)}", styles["Bullet"]))
 
 
-# ============================================================================
-# MAIN REPORT GENERATOR
-# ============================================================================
+    def _draw_footer(canvas, doc) -> None:
+        canvas.saveState()
+        canvas.setFont("Helvetica", 8)
+        canvas.setFillColor(DARK_GREY)
+        canvas.drawString(doc.leftMargin, 10 * mm, "Indian Long/Short Equity Research")
+        canvas.drawRightString(doc.pagesize[0] - doc.rightMargin, 10 * mm, f"Page {canvas.getPageNumber()}")
+        canvas.restoreState()
+
+
+    def _append_stock_pdf_section(
+        story: List[object],
+        row: pd.Series,
+        side: str,
+        medians: Dict[str, float],
+        styles: Dict[str, ParagraphStyle],
+        index_name: str = "NIFTY 50",
+    ) -> None:
+        name = _display_name(row, str(row.name))
+        symbol = row.get("symbol", row.name)
+        thesis = _build_long_thesis(row, medians) if side == "LONG" else _build_short_thesis(row, medians)
+        catalysts = _build_catalysts(row, side)
+        risks = _build_risks(row, side, medians)
+
+        story.append(Paragraph(f"{_escape_pdf(name)} ({_escape_pdf(symbol)})", styles["StockTitle"]))
+        story.append(
+            Paragraph(
+                _escape_pdf(f"Chart: {name} price versus {index_name} over the last 6 months, with volume and factor-score callouts."),
+                styles["Caption"],
+            )
+        )
+        story.append(Paragraph("Investment Thesis", styles["Subsection"]))
+        _append_bullets(story, thesis, styles)
+        story.append(Spacer(1, 2))
+        story.append(
+            _make_pdf_table(
+                ["Metric", "Value"],
+                _metric_rows(row),
+                styles,
+                col_widths=[62 * mm, 52 * mm],
+            )
+        )
+        story.append(Spacer(1, 5))
+        story.append(Paragraph("Catalysts", styles["Subsection"]))
+        _append_bullets(
+            story,
+            catalysts or ["Near-term earnings, sector rotation, and price confirmation will determine whether the current setup strengthens or fades."],
+            styles,
+        )
+        story.append(Paragraph("Risks", styles["Subsection"]))
+        _append_bullets(story, risks, styles)
+        story.append(HRFlowable(width="100%", thickness=0.4, color=MID_GREY, spaceBefore=5, spaceAfter=8))
+
+
+    def _build_pdf_report(
+        output_path: str,
+        scored_universe: pd.DataFrame,
+        long_book: pd.DataFrame,
+        short_book: pd.DataFrame,
+        price_data: Dict[str, pd.DataFrame],
+        index_data: Dict[str, pd.DataFrame],
+        pairs: List[Dict],
+    ) -> str:
+        styles = _get_styles()
+        as_of = _data_as_of(price_data, index_data)
+        medians = _score_medians(scored_universe)
+        executive = _executive_summary_paragraphs(scored_universe, long_book, short_book, index_data)
+        relative_payloads = _relative_trade_payloads(scored_universe, pairs)
+
+        doc = SimpleDocTemplate(
+            output_path,
+            pagesize=A4,
+            leftMargin=14 * mm,
+            rightMargin=14 * mm,
+            topMargin=15 * mm,
+            bottomMargin=16 * mm,
+            title="Indian Equity Research Report",
+            author="Indian Long/Short Equity Research System",
+        )
+
+        story: List[object] = [
+            Paragraph("Indian Equity Research Report", styles["Title"]),
+            Paragraph(f"Data as of: {as_of}", styles["Meta"]),
+            Paragraph("Universe: NIFTY 50 plus F&O-eligible Indian equities.", styles["Meta"]),
+            Spacer(1, 6),
+        ]
+
+        story.append(Paragraph("1. Executive Summary", styles["Section"]))
+        for paragraph in executive:
+            story.append(Paragraph(_escape_pdf(paragraph), styles["Body"]))
+
+        story.append(Paragraph("2. Market Overview", styles["Section"]))
+        story.append(Paragraph("Chart: YTD normalized performance of NIFTY 50, NIFTY Bank, and Sensex.", styles["Caption"]))
+        story.append(Paragraph("YTD Index Returns", styles["Subsection"]))
+        story.append(
+            _make_pdf_table(
+                ["Index", "YTD Return", "Latest Level"],
+                _index_rows(index_data),
+                styles,
+                col_widths=[62 * mm, 32 * mm, 38 * mm],
+            )
+        )
+        story.append(Spacer(1, 6))
+        story.append(Paragraph("Sector Performance Snapshot", styles["Subsection"]))
+        story.append(
+            _make_pdf_table(
+                ["Sector", "Stocks", "Avg 3M Return", "Avg 6M Return", "Median Composite", "Median P/E"],
+                _sector_rows(scored_universe),
+                styles,
+                col_widths=[42 * mm, 16 * mm, 25 * mm, 25 * mm, 26 * mm, 24 * mm],
+                small=True,
+            )
+        )
+        story.append(Spacer(1, 6))
+        story.append(Paragraph("Universe Statistics", styles["Subsection"]))
+        story.append(
+            _make_pdf_table(
+                ["Statistic", "Value"],
+                _universe_statistics(scored_universe),
+                styles,
+                col_widths=[72 * mm, 42 * mm],
+            )
+        )
+
+        story.append(Paragraph("3. Top Long Ideas", styles["Section"]))
+        if long_book.empty:
+            story.append(Paragraph("No qualifying long ideas were available in the current run.", styles["Body"]))
+        else:
+            for _, row in long_book.head(TOP_N_LONG).iterrows():
+                _append_stock_pdf_section(story, row, "LONG", medians, styles)
+
+        story.append(Paragraph("4. Top Short Ideas", styles["Section"]))
+        if short_book.empty:
+            story.append(Paragraph("No qualifying short ideas were available in the current run.", styles["Body"]))
+        else:
+            for _, row in short_book.head(TOP_N_SHORT).iterrows():
+                _append_stock_pdf_section(story, row, "SHORT", medians, styles)
+
+        story.append(Paragraph("5. Relative Trades", styles["Section"]))
+        if relative_payloads:
+            for payload in relative_payloads:
+                story.append(Paragraph(_escape_pdf(payload["title"]), styles["StockTitle"]))
+                _append_bullets(
+                    story,
+                    [
+                        f"Sector: {payload['sector']}",
+                        f"Notional ratio: {payload['ratio']}",
+                        f"Key spread driver: {payload['driver']}",
+                        payload["score_gap"],
+                        payload["quality_gap"],
+                        payload["momentum_gap"],
+                    ],
+                    styles,
+                )
+                story.append(Paragraph(_escape_pdf(payload["chart"]), styles["Caption"]))
+                story.append(Spacer(1, 4))
+        else:
+            story.append(Paragraph("No sector-matched pair trades were available from the current books.", styles["Body"]))
+
+        story.append(Paragraph("6. Appendix", styles["Section"]))
+        story.append(Paragraph("Top 20 Universe Ranking", styles["Subsection"]))
+        appendix_rows = []
+        for row in _appendix_rows(scored_universe):
+            appendix_rows.append(row[:7])
+        story.append(
+            _make_pdf_table(
+                ["Symbol", "Name", "Sector", "Composite", "Value", "Quality", "Momentum"],
+                appendix_rows or [["N/A"] * 7],
+                styles,
+                col_widths=[21 * mm, 46 * mm, 31 * mm, 18 * mm, 18 * mm, 18 * mm, 18 * mm],
+                small=True,
+            )
+        )
+        story.append(Spacer(1, 6))
+        story.append(Paragraph("Factor Definitions", styles["Subsection"]))
+        _append_bullets(
+            story,
+            [
+                "Value rewards cheaper valuation and higher free-cash-flow yield. Higher scores indicate cheaper stocks on the current metrics set.",
+                "Quality rewards stronger margins, better ROIC, and lower leverage. Higher scores indicate better operating quality and cleaner balance sheets.",
+                "Momentum rewards stronger 3-month and 6-month price performance. Higher scores indicate that market action is confirming the story.",
+                "Each factor and the composite are normalized to a 0-100 scale. Around 50 is neutral, the long book is drawn from the top decile, and the short book is drawn from the bottom decile of F&O-eligible names.",
+            ],
+            styles,
+        )
+
+        story.append(Paragraph("7. Disclaimer", styles["Section"]))
+        story.append(
+            Paragraph(
+                _escape_pdf(
+                    "This report is for informational purposes only and reflects a systematic interpretation of market data, factor signals, and recent price action. "
+                    "It is not investment advice, not a solicitation to buy or sell securities, and should not be used as the sole basis for any investment decision. "
+                    "Market conditions can change quickly, data may be revised, and all investing involves risk, including the risk of capital loss."
+                ),
+                styles["Disclaimer"],
+            )
+        )
+
+        doc.build(story, onFirstPage=_draw_footer, onLaterPages=_draw_footer)
+        logger.info("PDF report generated successfully: %s", output_path)
+        return output_path
+
 
 def generate_report(
     scored_universe: pd.DataFrame,
@@ -750,130 +989,71 @@ def generate_report(
     index_data: Dict[str, pd.DataFrame],
     pairs: List[Dict] = None,
     backtest_results: Dict = None,
-    output_filename: str = None
-) -> str:
+    output_filename: str = None,
+) -> Dict[str, Optional[str]]:
     """
-    Generate the complete hedge fund-style PDF report.
-    
-    Args:
-        scored_universe: Full scored universe DataFrame
-        long_book: Long positions DataFrame
-        short_book: Short positions DataFrame
-        price_data: Historical price data
-        index_data: Index benchmark data
-        pairs: Relative trade suggestions
-        backtest_results: Backtest output (optional)
-        output_filename: Custom output filename
-    
-    Returns:
-        Path to the generated PDF file
+    Generate the research report bundle.
+
+    Returns a dictionary with markdown and PDF artifact paths.
     """
+    del backtest_results
     ensure_directories()
-    
+
     if output_filename is None:
-        date_str = datetime.now().strftime("%Y%m%d_%H%M%S")
-        output_filename = f"indian_ls_equity_report_{date_str}.pdf"
-    
-    output_path = os.path.join(REPORTS_DIR, output_filename)
-    styles = get_report_styles()
-    
-    logger.info(f"Generating PDF report: {output_path}")
-    
-    # Create document
-    doc = SimpleDocTemplate(
-        output_path,
-        pagesize=A4,
-        topMargin=25 * mm,
-        bottomMargin=20 * mm,
-        leftMargin=20 * mm,
-        rightMargin=20 * mm,
-        title=REPORT_TITLE,
-        author="Systematic Equity Research"
-    )
-    
-    elements = []
-    
-    # 1. Cover Page
-    elements.extend(build_cover_page(styles))
-    
-    # 2. Market Overview
-    elements.extend(build_market_overview(styles, index_data, scored_universe))
-    
-    # 3. Long Ideas
-    elements.append(Paragraph("2. Top Long Ideas", styles["SectionTitle"]))
-    elements.append(HRFlowable(width="100%", thickness=1, color=GREEN, spaceAfter=10))
-    
-    for i, (ticker, row) in enumerate(long_book.head(TOP_N_LONG).iterrows()):
-        elements.extend(
-            build_stock_idea_section(styles, row, ticker, price_data, "LONG")
-        )
-    
-    elements.append(PageBreak())
-    
-    # 4. Short Ideas
-    elements.append(Paragraph("3. Top Short Ideas", styles["SectionTitle"]))
-    elements.append(HRFlowable(width="100%", thickness=1, color=RED, spaceAfter=10))
-    
-    for i, (ticker, row) in enumerate(short_book.head(TOP_N_SHORT).iterrows()):
-        elements.extend(
-            build_stock_idea_section(styles, row, ticker, price_data, "SHORT")
-        )
-    
-    elements.append(PageBreak())
-    
-    # 5. Relative Trades
-    if pairs:
-        elements.extend(build_relative_trades_section(styles, pairs))
-    
-    # 6. Appendix
-    elements.extend(
-        build_appendix(styles, scored_universe, backtest_results)
-    )
-    
-    # Build the PDF
-    try:
-        doc.build(elements)
-        logger.info(f"Report generated successfully: {output_path}")
-    except Exception as e:
-        logger.error(f"Failed to generate report: {e}")
-        raise
-    finally:
-        # Cleanup temporary PNG charts
-        for file in os.listdir(REPORTS_DIR):
-            if file.endswith(".png"):
-                try:
-                    os.remove(os.path.join(REPORTS_DIR, file))
-                except Exception as e:
-                    logger.debug(f"Failed to cleanup PNG {file}: {e}")
-    
-    return output_path
+        base_name = f"indian_equity_research_report_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+    else:
+        base_name = os.path.splitext(output_filename)[0]
 
+    markdown_path = os.path.join(REPORTS_DIR, f"{base_name}.md")
+    pdf_path = os.path.join(REPORTS_DIR, f"{base_name}.pdf")
+    report_pairs = pairs or []
 
-# ============================================================================
-# STANDALONE EXECUTION
-# ============================================================================
+    markdown_content = _markdown_report_content(
+        scored_universe=scored_universe,
+        long_book=long_book,
+        short_book=short_book,
+        price_data=price_data,
+        index_data=index_data,
+        pairs=report_pairs,
+    )
+    with open(markdown_path, "w", encoding="utf-8") as handle:
+        handle.write(markdown_content)
+    logger.info("Markdown report generated successfully: %s", markdown_path)
+
+    pdf_output = None
+    if REPORTLAB_AVAILABLE:
+        pdf_output = _build_pdf_report(
+            output_path=pdf_path,
+            scored_universe=scored_universe,
+            long_book=long_book,
+            short_book=short_book,
+            price_data=price_data,
+            index_data=index_data,
+            pairs=report_pairs,
+        )
+    else:
+        logger.warning("Skipping PDF generation because reportlab is unavailable: %s", REPORTLAB_IMPORT_ERROR)
+
+    return {
+        "markdown_path": markdown_path,
+        "pdf_path": pdf_output,
+    }
+
 
 if __name__ == "__main__":
     from data_ingestion import run_data_pipeline
     from factor_model import run_factor_model, suggest_relative_trades
-    
-    # Run data pipeline
+
     price_data, financial_data, metrics_df, index_data = run_data_pipeline()
-    
-    # Run factor model
     scored, longs, shorts = run_factor_model(metrics_df)
-    
-    # Relative trades
-    pairs = suggest_relative_trades(longs, shorts)
-    
-    # Generate report
-    report_path = generate_report(
+    del financial_data
+    artifacts = generate_report(
         scored_universe=scored,
         long_book=longs,
         short_book=shorts,
         price_data=price_data,
         index_data=index_data,
-        pairs=pairs
+        pairs=suggest_relative_trades(longs, shorts),
     )
-    
-    print(f"\nReport generated: {report_path}")
+    print(f"\nMarkdown report: {artifacts['markdown_path']}")
+    print(f"PDF report: {artifacts['pdf_path']}")

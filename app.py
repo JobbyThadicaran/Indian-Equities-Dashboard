@@ -860,8 +860,8 @@ def render_universe_table(filtered):
 # ============================================================================
 
 def handle_report_generation(data):
-    """Handle PDF report generation via the sidebar button."""
-    with st.spinner("Generating India market PDF report..."):
+    """Handle report generation via the sidebar button."""
+    with st.spinner("Generating India market research report..."):
         try:
             from report_generator import generate_report
             from factor_model import suggest_relative_trades
@@ -873,7 +873,7 @@ def handle_report_generation(data):
             # Try to load backtest results from cache
             backtest_results = load_from_cache("backtest_results")
             
-            report_path = generate_report(
+            artifacts = generate_report(
                 scored_universe=data["scored_universe"],
                 long_book=data["long_book"],
                 short_book=data["short_book"],
@@ -882,20 +882,43 @@ def handle_report_generation(data):
                 pairs=pairs,
                 backtest_results=backtest_results
             )
-            
-            st.success(f"✅ Report generated: `{report_path}`")
-            
-            # Offer download
-            if os.path.exists(report_path):
-                with open(report_path, "rb") as f:
+
+            pdf_path = artifacts.get("pdf_path") if isinstance(artifacts, dict) else None
+            markdown_path = artifacts.get("markdown_path") if isinstance(artifacts, dict) else artifacts
+
+            available_paths = [path for path in [pdf_path, markdown_path] if path]
+            if available_paths:
+                st.success(f"✅ Report generated: `{available_paths[0]}`")
+
+            download_col_pdf, download_col_md = st.columns(2)
+
+            if pdf_path and os.path.exists(pdf_path):
+                with open(pdf_path, "rb") as f:
                     pdf_bytes = f.read()
-                st.download_button(
-                    label="📄 Download PDF Report",
-                    data=pdf_bytes,
-                    file_name=os.path.basename(report_path),
-                    mime="application/pdf"
-                )
-                st.success("Report generated successfully!")
+                with download_col_pdf:
+                    st.download_button(
+                        label="📄 Download PDF Report",
+                        data=pdf_bytes,
+                        file_name=os.path.basename(pdf_path),
+                        mime="application/pdf"
+                    )
+            else:
+                with download_col_pdf:
+                    st.info("PDF output is unavailable in this environment.")
+
+            if markdown_path and os.path.exists(markdown_path):
+                with open(markdown_path, "r", encoding="utf-8") as f:
+                    report_text = f.read()
+                with download_col_md:
+                    st.download_button(
+                        label="📝 Download Markdown Source",
+                        data=report_text,
+                        file_name=os.path.basename(markdown_path),
+                        mime="text/markdown"
+                    )
+
+            if available_paths:
+                st.success("Report generated successfully.")
         except Exception as e:
             st.error(f"Failed to generate report: {e}")
 

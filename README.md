@@ -11,7 +11,7 @@ Systematic factor-based long/short research for Indian equities using the same v
 - The working universe is now built dynamically as `NIFTY 50 ∪ F&O`.
 - Live F&O discovery prefers `Zerodha` instruments when `ZERODHA_ACCESS_TOKEN` is available.
 - If live Zerodha auth is unavailable, the app falls back to public NSE/Nifty files and then to a bundled NIFTY 50 fallback set.
-- The dashboard and PDF report now speak in Indian-market terms instead of the old Europe/country setup.
+- The dashboard and report output now speak in Indian-market terms instead of the old Europe/country setup.
 
 ## Architecture
 
@@ -21,7 +21,7 @@ Systematic factor-based long/short research for Indian equities using the same v
 - `backtesting.py`: Applies the same F&O short-side restriction in historical simulation.
 - `sentiment_analysis.py`: News and sentiment for the Indian equity universe.
 - `app.py`: Streamlit dashboard.
-- `report_generator.py`: PDF report generation.
+- `report_generator.py`: Structured markdown research report generation with a styled PDF export.
 
 ## Setup
 
@@ -84,7 +84,10 @@ Generate from the sidebar or run:
 python3 report_generator.py
 ```
 
-Output is written to `reports/indian_ls_equity_report_<timestamp>.pdf`.
+Output is written to:
+
+- `reports/indian_equity_research_report_<timestamp>.pdf`
+- `reports/indian_equity_research_report_<timestamp>.md`
 
 ## Notes
 
