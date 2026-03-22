@@ -31,6 +31,34 @@ warnings.filterwarnings("ignore")
 logger = setup_logger("data_ingestion")
 
 
+def _is_financial_company(
+    sector: Optional[object] = None,
+    industry: Optional[object] = None,
+    info: Optional[Dict] = None,
+) -> bool:
+    """Flag banks, insurers, and similar financials where EV/EBITDA and ROIC are not comparable."""
+    info = info or {}
+    values = [
+        sector,
+        industry,
+        info.get("sector"),
+        info.get("industry"),
+        info.get("quoteType"),
+    ]
+    text = " ".join(str(value).lower() for value in values if value)
+    keywords = [
+        "financial",
+        "bank",
+        "insurance",
+        "capital markets",
+        "credit",
+        "asset management",
+        "nbfc",
+        "finserv",
+    ]
+    return any(keyword in text for keyword in keywords)
+
+
 def _universe_fingerprint(tickers: List[str]) -> str:
     """Generate a stable cache suffix for a specific ticker set."""
     unique = sorted(set(tickers))
@@ -182,12 +210,20 @@ def fetch_financial_data(
     """
     cache_key = f"financials_data_{_universe_fingerprint(tickers)}"
     cached = load_from_cache(cache_key)
-    if cached is not None and len(cached) > 0:
-        logger.info(f"Loaded financial data from cache ({len(cached)} tickers)")
-        return cached
-    
-    logger.info(f"Fetching financial statements for {len(tickers)} tickers")
     financial_data = {}
+    missing_tickers = list(tickers)
+    if cached is not None and len(cached) > 0:
+        financial_data = {ticker: cached[ticker] for ticker in tickers if ticker in cached}
+        missing_tickers = [ticker for ticker in tickers if ticker not in financial_data]
+        logger.info(
+            "Loaded financial data from cache (%s tickers); refetching %s missing tickers",
+            len(financial_data),
+            len(missing_tickers),
+        )
+        if not missing_tickers:
+            return financial_data
+    else:
+        logger.info(f"Fetching financial statements for {len(tickers)} tickers")
     
     def _fetch_financials(ticker: str) -> Tuple[str, Optional[Dict]]:
         """Fetch all financial data for a single ticker."""
@@ -219,10 +255,10 @@ def fetch_financial_data(
             return ticker, None
     
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        futures = {executor.submit(_fetch_financials, t): t for t in tickers}
+        futures = {executor.submit(_fetch_financials, t): t for t in missing_tickers}
         for future in tqdm(
             as_completed(futures),
-            total=len(tickers),
+            total=len(missing_tickers),
             desc="Downloading financials",
             ncols=80
         ):
@@ -269,7 +305,7 @@ def extract_key_metrics(
     # Check cache first
     if start is None or end is None:
         start, end, _ = get_date_range()
-    cache_key = f"key_metrics_{_universe_fingerprint(list(financial_data.keys()))}_{start}_{end}"
+    cache_key = f"key_metrics_v2_{_universe_fingerprint(list(financial_data.keys()))}_{start}_{end}"
     cached = load_from_cache(cache_key)
     if cached is not None and len(cached) > 0:
         logger.info(f"Loaded key metrics from cache ({len(cached)} stocks)")
@@ -360,6 +396,15 @@ def extract_key_metrics(
                         (net_income - prev_ni) if net_income is not None and prev_ni is not None else None,
                         prev_ni
                     )
+
+                if (
+                    pd.isna(record.get("ev_ebitda"))
+                    and record.get("enterprise_value") is not None
+                    and ebitda is not None
+                    and not pd.isna(ebitda)
+                    and ebitda > 0
+                ):
+                    record["ev_ebitda"] = safe_divide(record.get("enterprise_value"), ebitda)
             
             # ------------------------------------------------------------------
             # BALANCE SHEET METRICS
@@ -391,9 +436,12 @@ def extract_key_metrics(
                 
                 # Leverage: Net Debt / EBITDA
                 ebitda_val = record.get("ebitda")
-                record["leverage"] = safe_divide(
-                    record.get("net_debt"), ebitda_val
-                )
+                if ebitda_val is not None and not pd.isna(ebitda_val) and ebitda_val > 0:
+                    record["leverage"] = safe_divide(
+                        record.get("net_debt"), ebitda_val
+                    )
+                else:
+                    record["leverage"] = None
                 
                 # Total Equity for ROIC proxy
                 total_equity = None
@@ -405,12 +453,15 @@ def extract_key_metrics(
                 
                 # ROIC Proxy = Net Income / (Equity + Net Debt)
                 invested_capital = None
-                if total_equity is not None:
+                if total_equity is not None and not pd.isna(total_equity):
                     nd = record.get("net_debt", 0) or 0
                     invested_capital = total_equity + nd
-                record["roic"] = safe_divide(
-                    record.get("net_income"), invested_capital
-                )
+                if invested_capital is not None and not pd.isna(invested_capital) and invested_capital > 0:
+                    record["roic"] = safe_divide(
+                        record.get("net_income"), invested_capital
+                    )
+                else:
+                    record["roic"] = None
             
             # ------------------------------------------------------------------
             # MOMENTUM & RISK (from price data)
@@ -446,6 +497,19 @@ def extract_key_metrics(
             record["sector"] = info.get("sector", "Unknown")
             record["industry"] = info.get("industry", "Unknown")
             record["name"] = info.get("shortName") or info.get("longName", ticker)
+
+            if _is_financial_company(record.get("sector"), record.get("industry"), info):
+                for field in [
+                    "fcf",
+                    "fcf_yield",
+                    "ebitda",
+                    "ev_ebitda",
+                    "ebitda_margin",
+                    "net_debt",
+                    "leverage",
+                    "roic",
+                ]:
+                    record[field] = None
             
             records.append(record)
             

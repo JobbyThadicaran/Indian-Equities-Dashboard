@@ -374,9 +374,9 @@ def suggest_relative_trades(
                 s_ticker = sector_shorts.index[0]
                 pairs.append({
                     "long_ticker": l_ticker,
-                    "long_name": ticker_to_name(l_ticker),
+                    "long_name": sector_longs.loc[l_ticker].get("name", ticker_to_name(l_ticker)),
                     "short_ticker": s_ticker,
-                    "short_name": ticker_to_name(s_ticker),
+                    "short_name": sector_shorts.loc[s_ticker].get("name", ticker_to_name(s_ticker)),
                     "long_score": sector_longs.loc[l_ticker, "composite_score"],
                     "short_score": sector_shorts.loc[s_ticker, "composite_score"],
                     "score_spread": (
@@ -401,9 +401,9 @@ def suggest_relative_trades(
         
         pairs.append({
             "long_ticker": l_ticker,
-            "long_name": ticker_to_name(l_ticker),
+            "long_name": remaining_longs.loc[l_ticker].get("name", ticker_to_name(l_ticker)),
             "short_ticker": s_ticker,
-            "short_name": ticker_to_name(s_ticker),
+            "short_name": remaining_shorts.loc[s_ticker].get("name", ticker_to_name(s_ticker)),
             "long_score": remaining_longs.loc[l_ticker, "composite_score"],
             "short_score": remaining_shorts.loc[s_ticker, "composite_score"],
             "score_spread": (

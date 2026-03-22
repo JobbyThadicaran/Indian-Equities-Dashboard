@@ -177,6 +177,25 @@ def _score_medians(scored_universe: pd.DataFrame) -> Dict[str, float]:
     return medians
 
 
+def _is_financial_entity(row: pd.Series) -> bool:
+    text = " ".join(
+        str(value).lower()
+        for value in [row.get("sector"), row.get("industry")]
+        if value is not None and not pd.isna(value)
+    )
+    keywords = [
+        "financial",
+        "bank",
+        "insurance",
+        "capital markets",
+        "credit",
+        "asset management",
+        "nbfc",
+        "finserv",
+    ]
+    return any(keyword in text for keyword in keywords)
+
+
 def _metric_rows(row: pd.Series) -> List[List[str]]:
     return [
         ["Market Cap", fmt_large_number(row.get("market_cap"))],
@@ -209,13 +228,22 @@ def _long_strength_text(row: pd.Series) -> str:
         "momentum": _coerce_float(row.get("momentum_score")),
     }
     dominant = max(strengths, key=strengths.get)
+    is_financial = _is_financial_entity(row)
     if dominant == "value":
+        if is_financial:
+            return (
+                f"Valuation is doing the work here: P/E at {_fmt_multiple(row.get('pe_ratio'))} leaves the stock looking inexpensive against the broader market without leaning on industrial-company multiples."
+            )
         return (
             f"Valuation does most of the heavy lifting here: P/E at {_fmt_multiple(row.get('pe_ratio'))} "
             f"and EV/EBITDA at {_fmt_multiple(row.get('ev_ebitda'))} keep the stock competitive even before "
             "leaning on a rerating argument."
         )
     if dominant == "quality":
+        if is_financial:
+            return (
+                f"For a financial name, the cleaner signal is earnings quality rather than ROIC: net margin is {_fmt_pct(row.get('net_margin'))}, while the quality bucket is still scoring {_fmt_score(row.get('quality_score'))}/100."
+            )
         return (
             f"Quality is the standout driver with EBITDA margin at {_fmt_pct(row.get('ebitda_margin'))}, "
             f"net margin at {_fmt_pct(row.get('net_margin'))}, and ROIC at {_fmt_pct(row.get('roic'))}, "
@@ -235,12 +263,21 @@ def _short_weakness_text(row: pd.Series) -> str:
         "momentum": _coerce_float(100 - _coerce_float(row.get("momentum_score"))),
     }
     dominant = max(weaknesses, key=weaknesses.get)
+    is_financial = _is_financial_entity(row)
     if dominant == "value":
+        if is_financial:
+            return (
+                f"The valuation cushion is thin for a financial name: P/E at {_fmt_multiple(row.get('pe_ratio'))} is still not low enough to offset a weak overall ranking."
+            )
         return (
             f"The valuation cushion is thin: P/E at {_fmt_multiple(row.get('pe_ratio'))} and EV/EBITDA at "
             f"{_fmt_multiple(row.get('ev_ebitda'))} still look demanding for a stock with a weak overall score."
         )
     if dominant == "quality":
+        if is_financial:
+            return (
+                f"Fundamental quality is not helping. Net margin is {_fmt_pct(row.get('net_margin'))}, revenue growth is {_fmt_pct(row.get('revenue_growth_yoy'))}, and the quality bucket sits at only {_fmt_score(row.get('quality_score'))}/100."
+            )
         return (
             f"Operating quality is the core problem. EBITDA margin is {_fmt_pct(row.get('ebitda_margin'))}, "
             f"net margin is {_fmt_pct(row.get('net_margin'))}, and ROIC is {_fmt_pct(row.get('roic'))}, "
@@ -255,19 +292,32 @@ def _short_weakness_text(row: pd.Series) -> str:
 def _build_long_thesis(row: pd.Series, medians: Dict[str, float]) -> List[str]:
     name = _display_name(row, str(row.name))
     sector = row.get("sector", "its sector")
-    thesis = [
-        (
+    is_financial = _is_financial_entity(row)
+    valuation_line = (
+        f"{name} is one of the cleaner longs in {sector} because it pairs a composite score of "
+        f"{_fmt_score(row.get('composite_score'))}/100 with valuation at P/E {_fmt_multiple(row.get('pe_ratio'))}, "
+        f"versus a universe median of {_fmt_multiple(medians.get('pe_ratio'))}."
+        if is_financial
+        else (
             f"{name} is one of the cleaner longs in {sector} because it pairs a composite score of "
             f"{_fmt_score(row.get('composite_score'))}/100 with valuation at P/E {_fmt_multiple(row.get('pe_ratio'))} "
             f"and EV/EBITDA {_fmt_multiple(row.get('ev_ebitda'))}, versus universe medians of "
             f"{_fmt_multiple(medians.get('pe_ratio'))} and {_fmt_multiple(medians.get('ev_ebitda'))}."
-        ),
-        _long_strength_text(row),
-        (
+        )
+    )
+    balance_line = (
+        f"For a financial business, the cleaner read is earnings quality and growth: net margin is {_fmt_pct(row.get('net_margin'))} and revenue growth is {_fmt_pct(row.get('revenue_growth_yoy'))}, which is enough to keep the factor signal intact."
+        if is_financial
+        else (
             f"Balance-sheet risk is contained with leverage at {_fmt_multiple(row.get('leverage'))}, while "
             f"revenue growth of {_fmt_pct(row.get('revenue_growth_yoy'))} gives the market a fundamental reason "
             "to keep rewarding the factor signal."
-        ),
+        )
+    )
+    thesis = [
+        valuation_line,
+        _long_strength_text(row),
+        balance_line,
     ]
     return thesis
 
@@ -275,17 +325,23 @@ def _build_long_thesis(row: pd.Series, medians: Dict[str, float]) -> List[str]:
 def _build_short_thesis(row: pd.Series, medians: Dict[str, float]) -> List[str]:
     name = _display_name(row, str(row.name))
     sector = row.get("sector", "its sector")
+    is_financial = _is_financial_entity(row)
+    valuation_line = (
+        f"Compared with a universe median of {_fmt_multiple(medians.get('pe_ratio'))} P/E, the stock does not offer enough valuation support for a financial name with a weak factor profile."
+        if is_financial
+        else (
+            f"Compared with universe medians of {_fmt_multiple(medians.get('pe_ratio'))} P/E and "
+            f"{_fmt_multiple(medians.get('ev_ebitda'))} EV/EBITDA, the stock does not offer enough valuation support "
+            "to offset soft fundamentals or poor tape action."
+        )
+    )
     thesis = [
         (
             f"{name} falls into the short book with a composite score of {_fmt_score(row.get('composite_score'))}/100, "
             f"which is weak inside {sector} and sits well below the quality of names making the long side."
         ),
         _short_weakness_text(row),
-        (
-            f"Compared with universe medians of {_fmt_multiple(medians.get('pe_ratio'))} P/E and "
-            f"{_fmt_multiple(medians.get('ev_ebitda'))} EV/EBITDA, the stock does not offer enough valuation support "
-            "to offset soft fundamentals or poor tape action."
-        ),
+        valuation_line,
     ]
     return thesis
 
@@ -331,21 +387,32 @@ def _build_catalysts(row: pd.Series, side: str) -> List[str]:
 
 def _build_risks(row: pd.Series, side: str, medians: Dict[str, float]) -> List[str]:
     risks = []
+    is_financial = _is_financial_entity(row)
     if side == "LONG":
         risks.append(
             f"Volatility at {_fmt_pct(row.get('volatility'))} means even a high-ranked long can mean-revert sharply in a market-wide risk-off move."
         )
-        risks.append(
-            f"If margins or ROIC soften from current levels of {_fmt_pct(row.get('ebitda_margin'))} and {_fmt_pct(row.get('roic'))}, the premium embedded in the factor score could compress quickly."
-        )
+        if is_financial:
+            risks.append(
+                f"For a financial name, the key risk is a deterioration in earnings quality: net margin is {_fmt_pct(row.get('net_margin'))} today, and any pressure on that line could weaken the thesis quickly."
+            )
+        else:
+            risks.append(
+                f"If margins or ROIC soften from current levels of {_fmt_pct(row.get('ebitda_margin'))} and {_fmt_pct(row.get('roic'))}, the premium embedded in the factor score could compress quickly."
+            )
         if pd.notna(row.get("pe_ratio")) and pd.notna(medians.get("pe_ratio")) and row.get("pe_ratio") > medians.get("pe_ratio"):
             risks.append(
                 "This is not a deep-value long, so a miss on earnings or guidance can still trigger valuation de-rating."
             )
     else:
-        risks.append(
-            f"A positive surprise on margins or growth would matter because the stock is already carrying weak expectations at EBITDA margin {_fmt_pct(row.get('ebitda_margin'))} and revenue growth {_fmt_pct(row.get('revenue_growth_yoy'))}."
-        )
+        if is_financial:
+            risks.append(
+                f"A positive surprise on growth or profitability would matter because the stock is already carrying weak expectations at net margin {_fmt_pct(row.get('net_margin'))} and revenue growth {_fmt_pct(row.get('revenue_growth_yoy'))}."
+            )
+        else:
+            risks.append(
+                f"A positive surprise on margins or growth would matter because the stock is already carrying weak expectations at EBITDA margin {_fmt_pct(row.get('ebitda_margin'))} and revenue growth {_fmt_pct(row.get('revenue_growth_yoy'))}."
+            )
         risks.append(
             f"Volatility of {_fmt_pct(row.get('volatility'))} leaves room for sharp countertrend rallies that can hurt short timing even when the broader thesis stays intact."
         )
@@ -453,18 +520,47 @@ def _appendix_rows(scored_universe: pd.DataFrame) -> List[List[str]]:
     return rows or [["N/A"] * 11]
 
 
+def _pair_quality_gap_text(long_row: pd.Series, short_row: pd.Series) -> str:
+    if pd.notna(long_row.get("roic")) and pd.notna(short_row.get("roic")):
+        return (
+            f"The long carries EBITDA margin {_fmt_pct(long_row.get('ebitda_margin'))} and ROIC "
+            f"{_fmt_pct(long_row.get('roic'))} against {_fmt_pct(short_row.get('ebitda_margin'))} and "
+            f"{_fmt_pct(short_row.get('roic'))} on the short."
+        )
+    if pd.notna(long_row.get("net_margin")) and pd.notna(short_row.get("net_margin")):
+        return (
+            f"On comparable profitability metrics, the long posts net margin {_fmt_pct(long_row.get('net_margin'))} "
+            f"versus {_fmt_pct(short_row.get('net_margin'))} on the short, while quality scores are "
+            f"{_fmt_score(long_row.get('quality_score'))} versus {_fmt_score(short_row.get('quality_score'))}."
+        )
+    return (
+        f"The quality bucket still favours the long at {_fmt_score(long_row.get('quality_score'))} versus "
+        f"{_fmt_score(short_row.get('quality_score'))} on the short."
+    )
+
+
 def _relative_trade_payloads(
     scored_universe: pd.DataFrame,
+    long_book: pd.DataFrame,
+    short_book: pd.DataFrame,
     pairs: List[Dict],
 ) -> List[Dict[str, str]]:
     payloads = []
     for pair in pairs[:5]:
         long_ticker = pair.get("long_ticker")
         short_ticker = pair.get("short_ticker")
-        if long_ticker not in scored_universe.index or short_ticker not in scored_universe.index:
+        if long_ticker in getattr(long_book, "index", []):
+            long_row = long_book.loc[long_ticker]
+        elif long_ticker in scored_universe.index:
+            long_row = scored_universe.loc[long_ticker]
+        else:
             continue
-        long_row = scored_universe.loc[long_ticker]
-        short_row = scored_universe.loc[short_ticker]
+        if short_ticker in getattr(short_book, "index", []):
+            short_row = short_book.loc[short_ticker]
+        elif short_ticker in scored_universe.index:
+            short_row = scored_universe.loc[short_ticker]
+        else:
+            continue
         driver = _driver_label(long_row, short_row)
         payloads.append(
             {
@@ -477,11 +573,7 @@ def _relative_trade_payloads(
                     f"{_fmt_score(short_row.get('composite_score'))} for {pair['short_name']}, with {driver.lower()} "
                     "showing the widest separation."
                 ),
-                "quality_gap": (
-                    f"The long carries EBITDA margin {_fmt_pct(long_row.get('ebitda_margin'))} and ROIC "
-                    f"{_fmt_pct(long_row.get('roic'))} against {_fmt_pct(short_row.get('ebitda_margin'))} and "
-                    f"{_fmt_pct(short_row.get('roic'))} on the short."
-                ),
+                "quality_gap": _pair_quality_gap_text(long_row, short_row),
                 "momentum_gap": (
                     f"On momentum, the long is at {_fmt_pct(long_row.get('mom_6m'))} over 6 months versus "
                     f"{_fmt_pct(short_row.get('mom_6m'))} for the short, giving the spread a clear tape-confirmation angle."
@@ -540,7 +632,7 @@ def _markdown_report_content(
     as_of = _data_as_of(price_data, index_data)
     medians = _score_medians(scored_universe)
     executive = _executive_summary_paragraphs(scored_universe, long_book, short_book, index_data)
-    relative_payloads = _relative_trade_payloads(scored_universe, pairs)
+    relative_payloads = _relative_trade_payloads(scored_universe, long_book, short_book, pairs)
 
     sections = [
         f"# Indian Equity Research Report\n\n**Data as of:** {as_of}\n",
@@ -604,6 +696,7 @@ def _markdown_report_content(
                 "- Quality: rewards stronger margins, better ROIC, and lower leverage. Higher score means stronger operating quality and cleaner balance-sheet profile.",
                 "- Momentum: rewards stronger 3-month and 6-month price performance. Higher score means the market is already validating the story.",
                 "- Scoring range: each factor and the composite are normalized to a 0-100 scale. Around 50 is neutral, the long book is built from the top decile, and the short book is built from the bottom decile of F&O-eligible names.",
+                "- Composite methodology: the composite score is a weighted blend of the underlying sub-factor ranks, so the displayed Value, Quality, and Momentum bucket scores do not average exactly to the composite.",
                 "",
             ]
         )
@@ -845,7 +938,7 @@ if REPORTLAB_AVAILABLE:
         as_of = _data_as_of(price_data, index_data)
         medians = _score_medians(scored_universe)
         executive = _executive_summary_paragraphs(scored_universe, long_book, short_book, index_data)
-        relative_payloads = _relative_trade_payloads(scored_universe, pairs)
+        relative_payloads = _relative_trade_payloads(scored_universe, long_book, short_book, pairs)
 
         doc = SimpleDocTemplate(
             output_path,
@@ -960,6 +1053,7 @@ if REPORTLAB_AVAILABLE:
                 "Quality rewards stronger margins, better ROIC, and lower leverage. Higher scores indicate better operating quality and cleaner balance sheets.",
                 "Momentum rewards stronger 3-month and 6-month price performance. Higher scores indicate that market action is confirming the story.",
                 "Each factor and the composite are normalized to a 0-100 scale. Around 50 is neutral, the long book is drawn from the top decile, and the short book is drawn from the bottom decile of F&O-eligible names.",
+                "The composite score is a weighted blend of the underlying sub-factor ranks, so the displayed Value, Quality, and Momentum bucket scores do not average exactly to the composite.",
             ],
             styles,
         )
