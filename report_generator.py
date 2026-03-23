@@ -475,6 +475,28 @@ def _index_rows(index_data: Dict[str, pd.DataFrame]) -> List[List[str]]:
     return rows or [["N/A", "N/A", "N/A"]]
 
 
+def _gift_nifty_rows(gift_nifty_snapshot: Optional[Dict]) -> List[List[str]]:
+    if not gift_nifty_snapshot:
+        return [["N/A", "N/A", "N/A", "N/A", "N/A"]]
+    change = gift_nifty_snapshot.get("change")
+    change_pct = gift_nifty_snapshot.get("change_pct")
+    if change is None or pd.isna(change):
+        change_display = "N/A"
+    elif change_pct is None or pd.isna(change_pct):
+        change_display = _fmt_plain_number(change, 2)
+    else:
+        change_display = f"{_fmt_plain_number(change, 2)} ({_fmt_pct(change_pct)})"
+    return [
+        [
+            gift_nifty_snapshot.get("label", "GIFT NIFTY"),
+            _fmt_plain_number(gift_nifty_snapshot.get("last_price"), 2),
+            change_display,
+            gift_nifty_snapshot.get("timestamp", "N/A"),
+            gift_nifty_snapshot.get("source", "NSE IX"),
+        ]
+    ]
+
+
 def _sector_rows(scored_universe: pd.DataFrame) -> List[List[str]]:
     snapshot = _compute_sector_snapshot(scored_universe)
     rows = []
@@ -628,6 +650,7 @@ def _markdown_report_content(
     price_data: Dict[str, pd.DataFrame],
     index_data: Dict[str, pd.DataFrame],
     pairs: List[Dict],
+    gift_nifty_snapshot: Optional[Dict] = None,
 ) -> str:
     as_of = _data_as_of(price_data, index_data)
     medians = _score_medians(scored_universe)
@@ -644,6 +667,12 @@ def _markdown_report_content(
                 "",
                 "### YTD Index Returns",
                 _markdown_table(["Index", "YTD Return", "Latest Level"], _index_rows(index_data)),
+                "",
+                "### GIFT NIFTY Snapshot",
+                _markdown_table(
+                    ["Instrument", "Latest Level", "Change", "Timestamp", "Source"],
+                    _gift_nifty_rows(gift_nifty_snapshot),
+                ),
                 "",
                 "### Sector Performance Snapshot",
                 _markdown_table(
@@ -933,6 +962,7 @@ if REPORTLAB_AVAILABLE:
         price_data: Dict[str, pd.DataFrame],
         index_data: Dict[str, pd.DataFrame],
         pairs: List[Dict],
+        gift_nifty_snapshot: Optional[Dict] = None,
     ) -> str:
         styles = _get_styles()
         as_of = _data_as_of(price_data, index_data)
@@ -971,6 +1001,17 @@ if REPORTLAB_AVAILABLE:
                 _index_rows(index_data),
                 styles,
                 col_widths=[62 * mm, 32 * mm, 38 * mm],
+            )
+        )
+        story.append(Spacer(1, 6))
+        story.append(Paragraph("GIFT NIFTY Snapshot", styles["Subsection"]))
+        story.append(
+            _make_pdf_table(
+                ["Instrument", "Latest Level", "Change", "Timestamp", "Source"],
+                _gift_nifty_rows(gift_nifty_snapshot),
+                styles,
+                col_widths=[35 * mm, 28 * mm, 34 * mm, 42 * mm, 26 * mm],
+                small=True,
             )
         )
         story.append(Spacer(1, 6))
@@ -1084,6 +1125,7 @@ def generate_report(
     pairs: List[Dict] = None,
     backtest_results: Dict = None,
     output_filename: str = None,
+    gift_nifty_snapshot: Optional[Dict] = None,
 ) -> Dict[str, Optional[str]]:
     """
     Generate the research report bundle.
@@ -1109,6 +1151,7 @@ def generate_report(
         price_data=price_data,
         index_data=index_data,
         pairs=report_pairs,
+        gift_nifty_snapshot=gift_nifty_snapshot,
     )
     with open(markdown_path, "w", encoding="utf-8") as handle:
         handle.write(markdown_content)
@@ -1124,6 +1167,7 @@ def generate_report(
             price_data=price_data,
             index_data=index_data,
             pairs=report_pairs,
+            gift_nifty_snapshot=gift_nifty_snapshot,
         )
     else:
         logger.warning("Skipping PDF generation because reportlab is unavailable: %s", REPORTLAB_IMPORT_ERROR)

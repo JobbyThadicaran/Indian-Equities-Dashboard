@@ -145,6 +145,15 @@ INDEX_TICKERS = {
     "NIFTY Bank": "^NSEBANK",
     "BSE Sensex": "^BSESN",
 }
+INDEX_QUOTE_KEYS = {
+    "NIFTY 50": "NSE:NIFTY 50",
+    "NIFTY Bank": "NSE:NIFTY BANK",
+    "BSE Sensex": "BSE:SENSEX",
+}
+GIFT_NIFTY_SPOT_URL = "https://www1.nseix.com/api/nifty-market-rate"
+GIFT_NIFTY_FUTURES_URL = "https://www1.nseix.com/api/market-rate?type=derivative"
+LIVE_REFRESH_SECONDS = 300
+ZERODHA_QUOTE_BATCH_SIZE = 200
 
 COUNTRY_MAP = {ticker: "India" for ticker in FULL_UNIVERSE}
 

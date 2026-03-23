@@ -16,8 +16,12 @@ import numpy as np
 import plotly.graph_objects as go
 import plotly.express as px
 from plotly.subplots import make_subplots
+try:
+    from streamlit_autorefresh import st_autorefresh
+except ImportError:  # pragma: no cover - optional UI enhancement
+    st_autorefresh = None
 
-from config import MARKET_NAME, SHORT_BOOK_DESCRIPTION, UNIVERSE_DESCRIPTION
+from config import LIVE_REFRESH_SECONDS, MARKET_NAME, SHORT_BOOK_DESCRIPTION, UNIVERSE_DESCRIPTION
 from utils import (
     fmt_pct, fmt_number, fmt_large_number, fmt_ratio,
     ticker_to_name, load_from_cache, ensure_directories
@@ -126,7 +130,7 @@ st.markdown("""
 # DATA LOADING (cached)
 # ============================================================================
 
-@st.cache_data(ttl=3600, show_spinner="Loading market data...", hash_funcs={dict: lambda d: str(sorted(d.keys()))})
+@st.cache_data(ttl=LIVE_REFRESH_SECONDS, show_spinner="Loading market data...", hash_funcs={dict: lambda d: str(sorted(d.keys()))})
 def load_all_data():
     """
     Load all data — either from cache or by running the full pipeline.
@@ -141,6 +145,14 @@ def load_all_data():
     # Data ingestion
     price_data, financial_data, metrics_df, index_data = run_data_pipeline()
     
+    live_quote_mode = bool(metrics_df.attrs.get("live_quote_mode"))
+    live_quote_error = metrics_df.attrs.get("live_quote_error")
+    live_quote_source = metrics_df.attrs.get("live_quote_source")
+    live_quote_timestamp = metrics_df.attrs.get("live_quote_timestamp")
+    live_index_quotes = metrics_df.attrs.get("live_index_quotes", {})
+    gift_nifty_snapshot = metrics_df.attrs.get("gift_nifty_snapshot")
+    gift_nifty_error = metrics_df.attrs.get("gift_nifty_error")
+
     # Factor model
     scored_universe, long_book, short_book = run_factor_model(metrics_df)
     
@@ -185,6 +197,13 @@ def load_all_data():
         "sentiment_df": sentiment_df,
         "sentiment_summary": sentiment_summary,
         "pairs": pairs,
+        "live_quote_mode": live_quote_mode,
+        "live_quote_error": live_quote_error,
+        "live_quote_source": live_quote_source,
+        "live_quote_timestamp": live_quote_timestamp,
+        "live_index_quotes": live_index_quotes,
+        "gift_nifty_snapshot": gift_nifty_snapshot,
+        "gift_nifty_error": gift_nifty_error,
     }
 
 
@@ -357,26 +376,64 @@ def render_market_overview(data):
     st.markdown('<div class="section-header">📈 Market Overview</div>', unsafe_allow_html=True)
     
     index_data = data["index_data"]
+    live_index_quotes = data.get("live_index_quotes", {}) or {}
+    gift_nifty_snapshot = data.get("gift_nifty_snapshot")
     
     if not index_data:
         st.info("No index data available. Running data pipeline to fetch market data...")
         return
+
+    if data.get("live_quote_mode"):
+        snapshot_text = data.get("live_quote_timestamp")
+        if snapshot_text is not None:
+            snapshot_text = pd.to_datetime(snapshot_text).strftime("%Y-%m-%d %H:%M")
+        else:
+            snapshot_text = "latest available snapshot"
+        st.caption(f"Live quotes via Zerodha. Cards use live last price versus previous close. Auto-refresh runs every 5 minutes. Last snapshot: {snapshot_text}.")
+    elif data.get("live_quote_error"):
+        st.caption(f"Using historical daily data. Live Zerodha quotes unavailable: {data['live_quote_error']}.")
+
+    if gift_nifty_snapshot:
+        source = gift_nifty_snapshot.get("source", "NSE IX")
+        timestamp = gift_nifty_snapshot.get("timestamp", "N/A")
+        st.caption(f"GIFT NIFTY source: {source}. Snapshot time: {timestamp}.")
+    elif data.get("gift_nifty_error"):
+        st.caption(f"GIFT NIFTY snapshot unavailable: {data['gift_nifty_error']}.")
     
     # Index performance metrics
-    cols = st.columns(len(index_data))
+    metric_count = len(index_data) + (1 if gift_nifty_snapshot else 0)
+    cols = st.columns(metric_count)
     for i, (name, df) in enumerate(index_data.items()):
         with cols[i]:
             if "Close" in df.columns and len(df) > 1:
-                current = df["Close"].iloc[-1]
-                prev = df["Close"].iloc[0]
-                change = (current / prev - 1)
-                delta_color = "normal" if change >= 0 else "inverse"
+                live_snapshot = live_index_quotes.get(name, {})
+                if live_snapshot and live_snapshot.get("last_price") is not None:
+                    current = float(live_snapshot.get("last_price"))
+                    prev_close = ((live_snapshot.get("ohlc") or {}).get("close"))
+                    change = (current / prev_close - 1) if prev_close else None
+                else:
+                    current = df["Close"].iloc[-1]
+                    prev = df["Close"].iloc[0]
+                    change = (current / prev - 1)
+                delta_color = "normal" if (change is None or change >= 0) else "inverse"
                 st.metric(
                     label=name,
-                    value=f"{current:,.0f}",
-                    delta=f"{change:.2%}",
+                    value=f"{current:,.2f}",
+                    delta=f"{change:.2%}" if change is not None else "N/A",
                     delta_color=delta_color
                 )
+
+    if gift_nifty_snapshot:
+        with cols[-1]:
+            current = float(gift_nifty_snapshot.get("last_price", 0))
+            change = gift_nifty_snapshot.get("change_pct")
+            delta_color = "normal" if (change or 0) >= 0 else "inverse"
+            st.metric(
+                label=gift_nifty_snapshot.get("label", "GIFT NIFTY"),
+                value=f"{current:,.2f}",
+                delta=f"{change:.2%}" if change is not None else "N/A",
+                delta_color=delta_color,
+            )
     
     # Index performance chart
     st.markdown("#### Index Performance (Normalized)")
@@ -384,7 +441,7 @@ def render_market_overview(data):
     colors_list = ["#0f3460", "#27ae60", "#e74c3c", "#f39c12", "#9b59b6"]
     
     for i, (name, df) in enumerate(index_data.items()):
-        if "Close" in df.columns and len(df) > 0:
+        if "Close" in df.columns and len(df) > 1:
             normalized = (df["Close"] / df["Close"].iloc[0] - 1) * 100
             fig.add_trace(go.Scatter(
                 x=normalized.index,
@@ -880,7 +937,8 @@ def handle_report_generation(data):
                 price_data=data["price_data"],
                 index_data=data["index_data"],
                 pairs=pairs,
-                backtest_results=backtest_results
+                backtest_results=backtest_results,
+                gift_nifty_snapshot=data.get("gift_nifty_snapshot"),
             )
 
             pdf_path = artifacts.get("pdf_path") if isinstance(artifacts, dict) else None
@@ -929,6 +987,9 @@ def handle_report_generation(data):
 
 def main():
     """Main application entry point."""
+    if st_autorefresh is not None:
+        st_autorefresh(interval=LIVE_REFRESH_SECONDS * 1000, key="live_market_refresh")
+
     # Title
     st.markdown(
         "# 📊 Indian Long/Short Equity Research"
@@ -936,6 +997,7 @@ def main():
     st.markdown(
         f"_{UNIVERSE_DESCRIPTION} with Value · Quality · Momentum scoring_"
     )
+    st.caption("Live price snapshots refresh every 5 minutes when Zerodha quotes are available. Historical charts remain daily series with the live session appended.")
     st.markdown("---")
     
     # Load data

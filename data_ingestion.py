@@ -8,20 +8,23 @@ F&O-eligible stocks discovered via Zerodha/public files.
 """
 
 import hashlib
+import os
 import warnings
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
+import requests
 import yfinance as yf
 from tqdm import tqdm
 
 from config import (
     FULL_UNIVERSE, get_date_range, DATA_DIR,
-    INDEX_TICKERS, CACHE_EXPIRY_HOURS
+    INDEX_TICKERS, INDEX_QUOTE_KEYS, CACHE_EXPIRY_HOURS,
+    GIFT_NIFTY_SPOT_URL, GIFT_NIFTY_FUTURES_URL, ZERODHA_QUOTE_BATCH_SIZE
 )
-from market_universe import build_india_universe
+from market_universe import DEFAULT_USER_AGENT, ZERODHA_API_BASE, build_india_universe
 from utils import (
     setup_logger, ensure_directories, save_to_cache,
     load_from_cache, safe_divide
@@ -66,6 +69,198 @@ def _universe_fingerprint(tickers: List[str]) -> str:
         return "empty"
     digest = hashlib.sha1(",".join(unique).encode("utf-8")).hexdigest()[:12]
     return f"{len(unique)}_{digest}"
+
+
+def _chunked(items: List[str], size: int) -> List[List[str]]:
+    return [items[idx:idx + size] for idx in range(0, len(items), size)]
+
+
+def _parse_live_timestamp(snapshot: Dict) -> Optional[pd.Timestamp]:
+    for key in ("timestamp", "last_trade_time"):
+        value = snapshot.get(key)
+        if value:
+            try:
+                ts = pd.to_datetime(value)
+                if getattr(ts, "tzinfo", None) is not None:
+                    ts = ts.tz_convert(None)
+                return ts
+            except Exception:
+                continue
+    return None
+
+
+def _normalise_symbol_from_ticker(ticker: str, universe_metadata: Optional[pd.DataFrame]) -> str:
+    if universe_metadata is not None and not universe_metadata.empty and ticker in universe_metadata.index:
+        value = universe_metadata.loc[ticker].get("symbol")
+        if pd.notna(value):
+            return str(value)
+    return ticker.split(".")[0]
+
+
+def _apply_live_snapshot_to_frame(frame: pd.DataFrame, snapshot: Dict) -> pd.DataFrame:
+    """Merge a live quote snapshot into a daily OHLCV frame using today's date."""
+    if not snapshot or snapshot.get("last_price") in (None, 0):
+        return frame
+
+    base = frame.copy() if frame is not None else pd.DataFrame()
+    ohlc = snapshot.get("ohlc", {}) or {}
+    trade_ts = _parse_live_timestamp(snapshot) or pd.Timestamp.now()
+    row_date = trade_ts.normalize()
+    last_price = float(snapshot.get("last_price"))
+
+    row = {
+        "Open": float(ohlc.get("open", last_price)),
+        "High": float(ohlc.get("high", last_price)),
+        "Low": float(ohlc.get("low", last_price)),
+        "Close": last_price,
+    }
+    if "Volume" in base.columns or snapshot.get("volume") is not None:
+        row["Volume"] = snapshot.get("volume")
+
+    for column in base.columns:
+        if column in row:
+            continue
+        if column in {"Dividends", "Stock Splits"}:
+            row[column] = 0.0
+        else:
+            row[column] = np.nan
+
+    live_row = pd.DataFrame([row], index=[row_date])
+    if not base.empty and pd.to_datetime(base.index[-1]).normalize() == row_date:
+        base = base.iloc[:-1]
+    merged = pd.concat([base, live_row], axis=0)
+    merged.index = pd.to_datetime(merged.index).tz_localize(None)
+    merged = merged[~merged.index.duplicated(keep="last")].sort_index()
+    return merged
+
+
+def fetch_live_zerodha_quotes(
+    tickers: List[str],
+    universe_metadata: Optional[pd.DataFrame] = None,
+) -> Tuple[Dict[str, Dict], Dict[str, Dict], Optional[str]]:
+    """Fetch live quote snapshots for equities and benchmark indices from Zerodha."""
+    api_key = os.getenv("ZERODHA_API_KEY", "")
+    access_token = os.getenv("ZERODHA_ACCESS_TOKEN", "")
+    if not (api_key and access_token):
+        return {}, {}, "missing Zerodha API key or access token"
+
+    session = requests.Session()
+    session.headers.update(
+        {
+            "User-Agent": DEFAULT_USER_AGENT,
+            "X-Kite-Version": "3",
+            "Authorization": f"token {api_key}:{access_token}",
+        }
+    )
+
+    stock_request_map = {}
+    for ticker in tickers:
+        symbol = _normalise_symbol_from_ticker(ticker, universe_metadata)
+        if symbol:
+            stock_request_map[f"NSE:{symbol}"] = ticker
+
+    request_keys = list(stock_request_map.keys()) + list(INDEX_QUOTE_KEYS.values())
+    stock_quotes: Dict[str, Dict] = {}
+    index_quotes: Dict[str, Dict] = {}
+
+    try:
+        for batch in _chunked(request_keys, ZERODHA_QUOTE_BATCH_SIZE):
+            params = [("i", key) for key in batch]
+            response = session.get(f"{ZERODHA_API_BASE}/quote", params=params, timeout=15)
+            response.raise_for_status()
+            payload = response.json()
+            if payload.get("status") != "success":
+                raise ValueError(payload.get("message") or "quote API returned non-success status")
+            quote_data = payload.get("data", {})
+            for request_key, snapshot in quote_data.items():
+                if request_key in stock_request_map:
+                    stock_quotes[stock_request_map[request_key]] = snapshot
+                else:
+                    for name, key in INDEX_QUOTE_KEYS.items():
+                        if request_key == key:
+                            index_quotes[name] = snapshot
+                            break
+    except Exception as exc:
+        logger.warning("Live Zerodha quote fetch failed: %s", exc)
+        return {}, {}, str(exc)
+
+    logger.info(
+        "Fetched Zerodha live quotes for %s equities and %s indices",
+        len(stock_quotes),
+        len(index_quotes),
+    )
+    return stock_quotes, index_quotes, None
+
+
+def fetch_gift_nifty_snapshot() -> Tuple[Optional[Dict], Optional[str]]:
+    """Fetch the current GIFT NIFTY snapshot from official NSE IX endpoints."""
+    session = requests.Session()
+    session.headers.update({"User-Agent": DEFAULT_USER_AGENT, "Accept": "application/json"})
+
+    try:
+        response = session.get(GIFT_NIFTY_FUTURES_URL, timeout=12)
+        response.raise_for_status()
+        payload = response.json()
+        rows = payload.get("data", []) if isinstance(payload, dict) else []
+        nifty_rows = [row for row in rows if row.get("SYMBOL") == "NIFTY" and row.get("INSTRUMENTTYPE") == "FUTIDX"]
+        if nifty_rows:
+            nifty_rows.sort(key=lambda row: pd.to_datetime(row.get("EXPIRYDATE"), errors="coerce"))
+            row = nifty_rows[0]
+            expiry = row.get("EXPIRYDATE")
+            return {
+                "label": "GIFT NIFTY",
+                "last_price": float(row.get("LASTPRICE", 0)),
+                "change": float(row.get("DAYCHANGE_1", 0)),
+                "change_pct": float(row.get("PERCHANGE", 0)) / 100.0,
+                "timestamp": row.get("TIMESTMP"),
+                "source": f"NSE IX front-month futures ({expiry})" if expiry else "NSE IX front-month futures",
+                "expiry": expiry,
+            }, None
+    except Exception as exc:
+        logger.debug("GIFT NIFTY futures snapshot failed: %s", exc)
+
+    try:
+        response = session.get(GIFT_NIFTY_SPOT_URL, timeout=12)
+        response.raise_for_status()
+        payload = response.json()
+        if isinstance(payload, list) and payload:
+            row = payload[0]
+            label = str(
+                row.get("OI_INDEX_NAME")
+                or row.get("INDEX_NAME")
+                or row.get("name")
+                or ""
+            ).strip()
+            if "gift" in label.lower():
+                last_price = float(str(row.get("CURRVALUE", "0")).replace(",", ""))
+                change = float(row.get("CHANGE", 0))
+                change_pct = float(row.get("PERCHANGE", 0)) / 100.0
+                return {
+                    "label": label or "GIFT NIFTY",
+                    "last_price": last_price,
+                    "change": change,
+                    "change_pct": change_pct,
+                    "timestamp": row.get("FULLTIMESTAMP") or row.get("TIMESTAMP"),
+                    "source": "NSE IX market snapshot",
+                }, None
+    except Exception as exc:
+        logger.warning("GIFT NIFTY snapshot fetch failed: %s", exc)
+        return None, str(exc)
+
+    unmatched_label = None
+    try:
+        response = session.get(GIFT_NIFTY_SPOT_URL, timeout=12)
+        response.raise_for_status()
+        payload = response.json()
+        if isinstance(payload, list) and payload:
+            row = payload[0]
+            unmatched_label = row.get("OI_INDEX_NAME") or row.get("INDEX_NAME") or row.get("name")
+    except Exception:
+        pass
+
+    if unmatched_label:
+        return None, f"official NSE IX spot snapshot returned '{unmatched_label}' instead of an explicit GIFT NIFTY row"
+    return None, "official NSE IX endpoints returned no explicit GIFT NIFTY row"
 
 # ============================================================================
 # PRICE DATA FETCHING
@@ -609,6 +804,25 @@ def run_data_pipeline(
     
     # Step 2: Index data
     index_data = fetch_index_data(start, end)
+
+    # Step 2b: Overlay live quote snapshots when Zerodha credentials are available
+    live_stock_quotes, live_index_quotes, live_quote_error = fetch_live_zerodha_quotes(
+        universe,
+        universe_metadata=universe_metadata,
+    )
+    if live_stock_quotes:
+        price_data = {
+            ticker: _apply_live_snapshot_to_frame(frame, live_stock_quotes.get(ticker, {}))
+            for ticker, frame in price_data.items()
+        }
+    if live_index_quotes:
+        index_data = {
+            name: _apply_live_snapshot_to_frame(frame, live_index_quotes.get(name, {}))
+            for name, frame in index_data.items()
+        }
+    live_quote_mode = bool(live_stock_quotes or live_index_quotes)
+
+    gift_nifty_snapshot, gift_nifty_error = fetch_gift_nifty_snapshot()
     
     # Step 3: Financial statements (only for tickers with price data)
     valid_tickers = list(price_data.keys())
@@ -622,12 +836,32 @@ def run_data_pipeline(
         start=start,
         end=end,
     )
+    metrics_df.attrs["live_quote_mode"] = live_quote_mode
+    metrics_df.attrs["live_quote_error"] = live_quote_error
+    metrics_df.attrs["live_quote_source"] = "Zerodha quote snapshots" if live_quote_mode else None
+    metrics_df.attrs["live_index_quotes"] = live_index_quotes
+    metrics_df.attrs["live_quote_timestamp"] = max(
+        [
+            _parse_live_timestamp(snapshot)
+            for snapshot in list(live_stock_quotes.values()) + list(live_index_quotes.values())
+            if _parse_live_timestamp(snapshot) is not None
+        ],
+        default=None,
+    )
+    metrics_df.attrs["gift_nifty_snapshot"] = gift_nifty_snapshot
+    metrics_df.attrs["gift_nifty_error"] = gift_nifty_error
     
     logger.info("=" * 60)
     logger.info("DATA INGESTION COMPLETE")
     logger.info(f"Stocks with prices: {len(price_data)}")
     logger.info(f"Stocks with financials: {len(financial_data)}")
     logger.info(f"Stocks with metrics: {len(metrics_df)}")
+    if live_quote_mode:
+        logger.info("Live quote overlay: enabled via Zerodha")
+    elif live_quote_error:
+        logger.info("Live quote overlay unavailable: %s", live_quote_error)
+    if gift_nifty_snapshot:
+        logger.info("GIFT NIFTY snapshot: %s @ %s", gift_nifty_snapshot.get("last_price"), gift_nifty_snapshot.get("timestamp"))
     logger.info("=" * 60)
     
     return price_data, financial_data, metrics_df, index_data
